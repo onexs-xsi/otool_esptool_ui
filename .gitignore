@@ -1,0 +1,33 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+.venv/
+venv/
+
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+build_pyinstaller.log
+pyinstaller_build.log
+_MEI*/
+
+# 构建时自动生成，不需要版本控制
+file_version_info.txt
+
+# 内部笔记 / 一次性辅助脚本
+chaifen.md
+_gen_ico.py
+
+.idea/
+.vscode/
+
+.DS_Store
+Thumbs.db
