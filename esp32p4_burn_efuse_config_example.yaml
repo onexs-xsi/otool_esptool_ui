@@ -1,0 +1,67 @@
+# ESP32-P4 批量 eFuse 烧录字段配置示例
+# ─────────────────────────────────────────────────────────────────────────────
+# 此文件用于「熔丝台」→「从预设导入」功能（计划扩展）或手动参考。
+# 格式说明：
+#   burn_efuse_fields: 列表，每项是一条待烧录的 eFuse 字段配置
+#     enabled     — 是否启用（true / false）
+#     name        — espefuse.py 字段标识符（区分大小写）
+#     value       — 目标值，支持十进制 / 十六进制（"0x1"）/ 布尔文字（"True"）
+#     description — 人类可读说明（不传入 espefuse，仅用于界面注释）
+#
+# 注意：eFuse 一经写入不可撤销，请仔细确认字段名和值后再使用。
+# ─────────────────────────────────────────────────────────────────────────────
+
+burn_efuse_fields:
+
+  # ── USB PHY 选择 ─────────────────────────────────────────────────────────
+  - enabled: true
+    name: USB_PHY_SEL
+    value: "1"
+    description: >-
+      将内置 USB PHY 切换至 USB-OTG 1.1（GPIO26/27）。
+      置 1 后 USB-Serial/JTAG 通道（GPIO24/25）改走外置 PHY。
+      不可逆。
+
+  # # ── Flash 加密（示例，默认禁用）────────────────────────────────────────
+  # - enabled: false
+  #   name: DOWNLOAD_DIS_ENCRYPT
+  #   value: "1"
+  #   description: >-
+  #     禁止下载模式下的 Flash 加密写入。
+  #     开启 Flash 加密后建议同步设置此位，防止明文固件被写入。
+
+  # - enabled: false
+  #   name: DOWNLOAD_DIS_DECRYPT
+  #   value: "1"
+  #   description: >-
+  #     禁止下载模式下的 Flash 解密读取（防止固件被读出）。
+
+  # # ── JTAG 访问控制（示例，默认禁用）────────────────────────────────────
+  # - enabled: false
+  #   name: JTAG_SEL_ENABLE
+  #   value: "1"
+  #   description: >-
+  #     允许通过 GPIO 选择是否使能 JTAG（配合 SOFT_DIS_JTAG 使用）。
+
+  # - enabled: false
+  #   name: SOFT_DIS_JTAG
+  #   value: "7"
+  #   description: >-
+  #     软禁用 JTAG（3-bit OTP，值为 0x7 时完全禁止）。
+  #     量产设备建议在完成调试后烧录。
+
+  # # ── 安全启动（示例，默认禁用）──────────────────────────────────────────
+  # - enabled: false
+  #   name: SECURE_BOOT_EN
+  #   value: "1"
+  #   description: >-
+  #     使能安全启动（Secure Boot V2）。
+  #     须在烧录 SECURE_BOOT_EN 前先将公钥摘要写入 KEY_PURPOSE_* / BLOCK*。
+  #     不可逆，务必先完成密钥烧录再开启。
+
+  # - enabled: false
+  #   name: SECURE_BOOT_AGGRESSIVE_REVOKE
+  #   value: "1"
+  #   description: >-
+  #     在启动验证失败时立即撤销对应签名密钥槽。
+  #     配合安全启动使用，防止密钥被爆破利用。

@@ -1,3 +1,4 @@
+import json
 import re
 
 from PyQt6.QtCore import QProcess, QProcessEnvironment, Qt
@@ -48,7 +49,7 @@ class EFuseDialog(QDialog):
         self.process: QProcess | None = None
         self._read_buf: list[str] = []
         self._is_reading = False
-        self._all_rows: list[tuple[str, str, str]] = []
+        self._all_rows: list[tuple[str, str, str, bool, bool]] = []
         self.setWindowTitle(f"eFuse — {device.port}")
         self.setWindowFlags(
             self.windowFlags()
@@ -111,14 +112,16 @@ class EFuseDialog(QDialog):
         tbl_hdr.addWidget(self.only_burned_btn)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["字段名", "当前值", "描述", "状态"])
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(["状态", "读写", "字段名", "当前值", "描述"])
         hv = self.table.horizontalHeader()
-        hv.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        hv.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        hv.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        hv.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(3, 96)
+        hv.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        hv.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        hv.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        hv.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        hv.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self.table.setColumnWidth(0, 80)
+        self.table.setColumnWidth(1, 66)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
@@ -230,13 +233,43 @@ class EFuseDialog(QDialog):
             return False
         return True
 
-    def _parse_summary(self, text: str) -> list[tuple[str, str, str]]:
-        """Return list of (name, value, description) from espefuse summary output."""
-        results: list[tuple[str, str, str]] = []
+    @staticmethod
+    def _parse_summary_json(text: str) -> list[tuple[str, str, str, bool, bool]]:
+        """Parse espefuse summary --format json output.
+
+        Locates the outermost JSON object in mixed stdout/stderr output and
+        returns a list of (name, display_value, description, readable, writeable).
+        """
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start == -1 or end == 0:
+            return []
+        try:
+            data = json.loads(text[start:end])
+        except json.JSONDecodeError:
+            return []
+        results: list[tuple[str, str, str, bool, bool]] = []
+        for name, info in data.items():
+            if not isinstance(info, dict):
+                continue
+            raw = info.get("value")
+            display = str(raw) if raw is not None else "0"
+            desc = str(info.get("description", ""))
+            readable = bool(info.get("readable", True))
+            writeable = bool(info.get("writeable", True))
+            results.append((name, display, desc, readable, writeable))
+        return results
+
+    @staticmethod
+    def _parse_summary_text(text: str) -> list[tuple[str, str, str, bool, bool]]:
+        """Fallback: parse plain-text espefuse summary output via regex.
+
+        Returns list of (name, value, description, readable, writeable).
+        """
+        results: list[tuple[str, str, str, bool, bool]] = []
         # Format: NAME (BLOCKX)   description...   = value  R/W (optional_canonical)
-        # The line may end with (0xN) / (0bN) after R/W — do NOT anchor to $
         field_re = re.compile(
-            r"^\s*([A-Z][A-Z0-9_]{2,})\s+\(([^)]*)\)(.*?)\s+=\s*(.+?)\s+(?:R/W|R-|-/-|R/-)"
+            r"^\s*([A-Z][A-Z0-9_]{2,})\s+\(([^)]*)\)(.*?)\s+=\s*(.+?)\s+(R/W|R/-|-/W|-/-|R-)"
         )
         for line in text.splitlines():
             if "read_regs" in line:
@@ -245,55 +278,79 @@ class EFuseDialog(QDialog):
             if not m:
                 continue
             name = m.group(1).strip()
-            desc = m.group(3).strip()   # group(2) = block name, group(3) = description
+            desc = m.group(3).strip()
             value = m.group(4).strip()
-            results.append((name, value, desc))
+            perms = m.group(5).strip()   # "R/W", "R/-", "-/W", "-/-"
+            readable = perms[0] == "R"
+            writeable = len(perms) >= 3 and perms[2] == "W"
+            results.append((name, value, desc, readable, writeable))
         return results
 
-    def _populate_table(self, rows: list[tuple[str, str, str]]) -> None:
+    def _populate_table(self, rows: list[tuple[str, str, str, bool, bool]]) -> None:
         self._all_rows = rows
         self._filter_table()
+
+    @staticmethod
+    def _make_badge_cell(label: str, obj_name: str) -> QWidget:
+        lbl = QLabel(label)
+        lbl.setObjectName(obj_name)
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        w = QWidget()
+        lay = QHBoxLayout(w)
+        lay.setContentsMargins(2, 1, 2, 1)
+        lay.addWidget(lbl)
+        return w
 
     def _filter_table(self) -> None:
         rows = self._all_rows
         query = self.search_edit.text().strip().lower()
         only_burned = self.only_burned_btn.isChecked()
 
-        filtered: list[tuple[str, str, str, bool]] = []
-        for name, value, desc in rows:
+        filtered: list[tuple[str, str, str, bool, bool, bool]] = []
+        for name, value, desc, readable, writeable in rows:
             burned = self._is_burned(value)
             if only_burned and not burned:
                 continue
             if query and query not in name.lower() and query not in desc.lower():
                 continue
-            filtered.append((name, value, desc, burned))
+            filtered.append((name, value, desc, readable, writeable, burned))
 
         self.table.setRowCount(len(filtered))
-        for row, (name, value, desc, burned) in enumerate(filtered):
+        for row, (name, value, desc, readable, writeable, burned) in enumerate(filtered):
+            # col 0 — 状态 badge
+            self.table.setCellWidget(
+                row, 0,
+                self._make_badge_cell(
+                    "● 已熔丝" if burned else "○ 未熔丝",
+                    "burnedBadge" if burned else "unburnedBadge",
+                )
+            )
+
+            # col 1 — 读写 badge
+            if readable and writeable:
+                rw_text, rw_obj = "R/W", "rwBadgeRW"
+            elif readable:
+                rw_text, rw_obj = "R/-", "rwBadgeR"
+            elif writeable:
+                rw_text, rw_obj = "-/W", "rwBadgeW"
+            else:
+                rw_text, rw_obj = "-/-", "rwBadgeNo"
+            self.table.setCellWidget(row, 1, self._make_badge_cell(rw_text, rw_obj))
+
+            # col 2 — 字段名
             name_item = QTableWidgetItem(name)
             bold_font = QFont()
             bold_font.setBold(burned)
             name_item.setFont(bold_font)
+            self.table.setItem(row, 2, name_item)
 
+            # col 3 — 当前值
             value_item = QTableWidgetItem(value)
-            value_item.setTextAlignment(
-                int(Qt.AlignmentFlag.AlignCenter)
-            )
+            value_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+            self.table.setItem(row, 3, value_item)
 
-            desc_item = QTableWidgetItem(desc)
-
-            state_lbl = QLabel("● 已熔丝" if burned else "○ 未熔丝")
-            state_lbl.setObjectName("burnedBadge" if burned else "unburnedBadge")
-            state_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            cell_w = QWidget()
-            cl = QHBoxLayout(cell_w)
-            cl.setContentsMargins(4, 1, 4, 1)
-            cl.addWidget(state_lbl)
-
-            self.table.setItem(row, 0, name_item)
-            self.table.setItem(row, 1, value_item)
-            self.table.setItem(row, 2, desc_item)
-            self.table.setCellWidget(row, 3, cell_w)
+            # col 4 — 描述
+            self.table.setItem(row, 4, QTableWidgetItem(desc))
 
         total = len(rows)
         shown = len(filtered)
@@ -302,7 +359,7 @@ class EFuseDialog(QDialog):
         )
 
     def _on_row_double_clicked(self, row: int, _col: int) -> None:
-        item = self.table.item(row, 0)
+        item = self.table.item(row, 2)   # col 2 = 字段名
         if item:
             self.efuse_name_edit.setText(item.text())
             self.efuse_value_edit.setText("1")
@@ -334,7 +391,7 @@ class EFuseDialog(QDialog):
         self._is_reading = True
         self.row_count_lbl.setText("正在读取 eFuse…")
         self.burn_log.clear()
-        cmd = self._build_base_cmd() + ["summary"]
+        cmd = self._build_base_cmd() + ["summary", "--format", "json"]
         self._run_cmd(cmd, log=self.burn_log)
 
     def _run_cmd(self, cmd: list[str], log: QPlainTextEdit | None) -> None:
@@ -376,7 +433,9 @@ class EFuseDialog(QDialog):
     def _on_finished(self, exit_code: int, _) -> None:
         if self._is_reading:
             full_text = "".join(self._read_buf)
-            rows = self._parse_summary(full_text)
+            rows = self._parse_summary_json(full_text)
+            if not rows:
+                rows = self._parse_summary_text(full_text)
             self._populate_table(rows)
             self._is_reading = False
             if exit_code != 0:
@@ -450,6 +509,26 @@ class EFuseDialog(QDialog):
                 background: #f0f2f5; border: 1px solid #d0d5df;
                 border-radius: 999px; padding: 1px 9px;
                 color: #9aa5bc; font-size: 11px;
+            }
+            QLabel#rwBadgeRW {
+                background: #e6f4ea; border: 1px solid #86c98a;
+                border-radius: 999px; padding: 1px 9px;
+                color: #1a6b28; font-size: 11px; font-weight: 600;
+            }
+            QLabel#rwBadgeR {
+                background: #e8f0fe; border: 1px solid #93b4f8;
+                border-radius: 999px; padding: 1px 9px;
+                color: #1a4ea6; font-size: 11px; font-weight: 600;
+            }
+            QLabel#rwBadgeW {
+                background: #fff8e1; border: 1px solid #f6c843;
+                border-radius: 999px; padding: 1px 9px;
+                color: #92400e; font-size: 11px; font-weight: 600;
+            }
+            QLabel#rwBadgeNo {
+                background: #fce8e8; border: 1px solid #f09090;
+                border-radius: 999px; padding: 1px 9px;
+                color: #991b1b; font-size: 11px; font-weight: 600;
             }
             QTableWidget {
                 background: #ffffff;

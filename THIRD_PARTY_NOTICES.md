@@ -25,6 +25,11 @@ OTool Esptool UI 由 ONEXS 维护。
 - 用途：构建 Windows 可执行文件
 - 来源：https://pyinstaller.org/
 
+## PyYAML
+
+- 用途：解析 eFuse 字段配置文件（.yaml / .yml）
+- 来源：https://github.com/yaml/pyyaml
+
 ## Notes
 
 - 如果你重新分发 dist/otool_esptool_ui.exe，请同时保留本文件。

@@ -73,6 +73,7 @@ from .constants import (
     resolve_chip_arg,
 )
 from .device_card import DeviceCard
+from .efuse_batch_dialog import BurnEfuseBatchWidget
 from .efuse_dialog import EFuseDialog
 from .flow_layout import FlowLayout
 from .helpers import _build_avatar_icon, _build_github_icon, _fetch_remote_avatar_bytes
@@ -238,6 +239,68 @@ class TabSwitcher(QWidget):
         p.end()
 
 
+class FlashEntryRow(QWidget):
+    """单条烧录条目：地址 + 固件路径 + 浏览 + 移除。"""
+
+    remove_requested = pyqtSignal()
+
+    def __init__(
+        self, addr: str = "0x0", path: str = "", parent: "QWidget | None" = None
+    ) -> None:
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 1, 0, 1)
+        lay.setSpacing(6)
+
+        addr_lbl = QLabel("地址")
+        addr_lbl.setObjectName("configLabel")
+        self.addr_edit = QLineEdit(addr)
+        self.addr_edit.setPlaceholderText("0x0")
+        self.addr_edit.setFixedWidth(90)
+
+        path_lbl = QLabel("固件")
+        path_lbl.setObjectName("configLabel")
+        self.path_edit = QLineEdit(path)
+        self.path_edit.setPlaceholderText("选择待烧录的 .bin 固件文件")
+
+        browse_btn = QPushButton("选择")
+        browse_btn.setFixedWidth(52)
+        browse_btn.clicked.connect(self._browse)
+
+        self.remove_btn = QPushButton("✕")
+        self.remove_btn.setObjectName("entryRemoveButton")
+        self.remove_btn.setFixedSize(26, 26)
+        self.remove_btn.clicked.connect(self.remove_requested)
+
+        lay.addWidget(addr_lbl)
+        lay.addWidget(self.addr_edit)
+        lay.addSpacing(4)
+        lay.addWidget(path_lbl)
+        lay.addWidget(self.path_edit, 1)
+        lay.addWidget(browse_btn)
+        lay.addWidget(self.remove_btn)
+
+    def _browse(self) -> None:
+        start_dir = str(
+            DEFAULT_FIRMWARE_DIR if DEFAULT_FIRMWARE_DIR.exists() else TOOL_DIR
+        )
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择固件",
+            start_dir,
+            "Binary Files (*.bin);;All Files (*.*)",
+        )
+        if file_path:
+            self.path_edit.setText(file_path)
+            self._auto_set_addr(file_path)
+
+    def _auto_set_addr(self, path: str) -> None:
+        """从文件名中提取地址标记（如 _0x10000），无则置 0x0。"""
+        stem = Path(path).stem
+        match = re.search(r'_(0[xX][0-9a-fA-F]+)$', stem)
+        self.addr_edit.setText(match.group(1).lower() if match else "0x0")
+
+
 class OtoolEsptoolUI(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -249,7 +312,7 @@ class OtoolEsptoolUI(QMainWindow):
         self.refresh_timer.setInterval(2500)
         self.refresh_timer.timeout.connect(self.refresh_ports)
         self.setWindowTitle(f"{APP_TITLE} v{APP_VERSION}")
-        self.resize(1100, 680)
+        self.resize(1320, 816)
         self._init_ui()
         self._apply_style()
         self._card_scale: float = 1.0
@@ -262,6 +325,9 @@ class OtoolEsptoolUI(QMainWindow):
         root_layout = QVBoxLayout(central)
         root_layout.setContentsMargins(16, 12, 16, 12)
         root_layout.setSpacing(10)
+
+        # 页 1 — 熔丝台（提前创建，供 toolbar 引用其控件）
+        self._efuse_batch_widget = BurnEfuseBatchWidget()
 
         # ── 顶部工具栏 ─────────────────────────────────────
         toolbar = QFrame()
@@ -289,6 +355,8 @@ class OtoolEsptoolUI(QMainWindow):
 
         self.refresh_ports_button = QPushButton("刷新设备")
         self.refresh_ports_button.clicked.connect(self.refresh_ports)
+        self.clear_devices_button = QPushButton("清空设备")
+        self.clear_devices_button.clicked.connect(self.clear_devices)
         self.auto_refresh_button = QPushButton("自动刷新: 关")
         self.auto_refresh_button.setCheckable(True)
         self.auto_refresh_button.toggled.connect(self.toggle_auto_refresh)
@@ -302,6 +370,7 @@ class OtoolEsptoolUI(QMainWindow):
         self.stop_all_button = QPushButton("全部停止")
         self.stop_all_button.setObjectName("dangerButton")
         self.stop_all_button.clicked.connect(self.stop_all_devices)
+        self.stop_all_button.clicked.connect(self._efuse_batch_widget._stop_all)
 
         row1.addWidget(title)
         row1.addSpacing(12)
@@ -310,7 +379,6 @@ class OtoolEsptoolUI(QMainWindow):
         row1.addWidget(self.success_stat)
         row1.addWidget(self.failed_stat)
         row1.addStretch(1)
-        row1.addWidget(self.refresh_ports_button)
         self._flash_btns_group = QWidget()
         _fbg = QHBoxLayout(self._flash_btns_group)
         _fbg.setContentsMargins(0, 0, 0, 0)
@@ -319,12 +387,26 @@ class OtoolEsptoolUI(QMainWindow):
         _fbg.addWidget(self.auto_flash_button)
         _fbg.addWidget(self.flash_all_button)
         _fbg.addWidget(self.erase_all_button)
+        # 熔丝台控件组（初始隐藏）
+        self._efuse_btns_group = QWidget()
+        _ebg = QHBoxLayout(self._efuse_btns_group)
+        _ebg.setContentsMargins(0, 0, 0, 0)
+        _ebg.setSpacing(8)
+        _chip_lbl2 = QLabel("芯片型号")
+        _chip_lbl2.setObjectName("configLabel")
+        _ebg.addWidget(_chip_lbl2)
+        _ebg.addWidget(self._efuse_batch_widget._chip_combo)
+        _ebg.addWidget(self._efuse_batch_widget._auto_burn_btn)
+        self._efuse_btns_group.setVisible(False)
         row1.addWidget(self._flash_btns_group)
+        row1.addWidget(self._efuse_btns_group)
         row1.addWidget(self.stop_all_button)
 
-        # 第二行：配置参数 + 状态文字
-        row2 = QHBoxLayout()
-        row2.setSpacing(8)
+        # 第二行：烧录台 row2
+        self._flash_row2 = QWidget()
+        _fr2 = QHBoxLayout(self._flash_row2)
+        _fr2.setContentsMargins(0, 0, 0, 0)
+        _fr2.setSpacing(8)
 
         baud_label = QLabel("波特率")
         baud_label.setObjectName("configLabel")
@@ -336,41 +418,67 @@ class OtoolEsptoolUI(QMainWindow):
         self.baud_edit.setFixedWidth(110)
         self.baud_edit.lineEdit().setPlaceholderText("波特率")
 
-        addr_label = QLabel("地址")
-        addr_label.setObjectName("configLabel")
-        self.address_edit = QLineEdit("0x0")
-        self.address_edit.setPlaceholderText("例如 0x0")
-        self.address_edit.setFixedWidth(80)
-
-        bin_label = QLabel("固件")
-        bin_label.setObjectName("configLabel")
-        self.bin_edit = QLineEdit()
-        self.bin_edit.setPlaceholderText("选择待烧录的 .bin 固件文件")
-        self.bin_browse_button = QPushButton("选择固件")
-        self.bin_browse_button.clicked.connect(self.browse_firmware)
-
         self.status_label = QLabel("状态: 正在等待设备")
         self.status_label.setObjectName("statusLabel")
 
-        row2.addWidget(baud_label)
-        row2.addWidget(self.baud_edit)
-        row2.addSpacing(4)
-        self._flash_cfg_group = QWidget()
-        _fcg = QHBoxLayout(self._flash_cfg_group)
-        _fcg.setContentsMargins(0, 0, 0, 0)
-        _fcg.setSpacing(8)
-        _fcg.addWidget(addr_label)
-        _fcg.addWidget(self.address_edit)
-        _fcg.addSpacing(4)
-        _fcg.addWidget(bin_label)
-        _fcg.addWidget(self.bin_edit, 1)
-        _fcg.addWidget(self.bin_browse_button)
-        row2.addWidget(self._flash_cfg_group, 1)
-        row2.addSpacing(12)
-        row2.addWidget(self.status_label)
+        _fr2.addWidget(baud_label)
+        _fr2.addWidget(self.baud_edit)
+        _fr2.addSpacing(4)
+        _fr2.addWidget(self.refresh_ports_button)
+        _fr2.addWidget(self.clear_devices_button)
+        _fr2.addStretch(1)
+        _fr2.addWidget(self.status_label)
+
+        # 第二行：熔丝台 row2
+        self._efuse_row2 = QWidget()
+        _er2 = QHBoxLayout(self._efuse_row2)
+        _er2.setContentsMargins(0, 0, 0, 0)
+        _er2.setSpacing(8)
+        self._efuse_refresh_btn = QPushButton("刷新设备")
+        self._efuse_refresh_btn.clicked.connect(self._efuse_batch_widget._poll_ports)
+        self._efuse_clear_btn = QPushButton("清空设备")
+        self._efuse_clear_btn.clicked.connect(self._efuse_batch_widget._clear_all_devices)
+        _er2.addWidget(self._efuse_refresh_btn)
+        _er2.addWidget(self._efuse_clear_btn)
+        _er2.addStretch(1)
+        self._efuse_row2.setVisible(False)
+
+        row2 = QHBoxLayout()
+        row2.setSpacing(0)
+        row2.addWidget(self._flash_row2)
+        row2.addWidget(self._efuse_row2)
+
+        # 烧录条目区（整体作为 _flash_cfg_group，便于 tab 切换时统一隐藏）
+        entries_outer = QWidget()
+        entries_layout = QVBoxLayout(entries_outer)
+        entries_layout.setContentsMargins(0, 2, 0, 2)
+        entries_layout.setSpacing(2)
+
+        entries_header = QHBoxLayout()
+        entries_header.setSpacing(8)
+        entries_lbl = QLabel("烧录条目")
+        entries_lbl.setObjectName("configLabel")
+        self._add_entry_btn = QPushButton("＋ 添加条目")
+        self._add_entry_btn.setObjectName("addEntryButton")
+        self._add_entry_btn.clicked.connect(lambda: self._add_flash_entry())
+        entries_header.addWidget(entries_lbl)
+        entries_header.addStretch(1)
+        entries_header.addWidget(self._add_entry_btn)
+
+        self._entries_inner = QWidget()
+        self._entries_vbox = QVBoxLayout(self._entries_inner)
+        self._entries_vbox.setContentsMargins(0, 0, 0, 0)
+        self._entries_vbox.setSpacing(2)
+
+        entries_layout.addLayout(entries_header)
+        entries_layout.addWidget(self._entries_inner)
+
+        self._flash_cfg_group = entries_outer
+        self._flash_rows: list[FlashEntryRow] = []
 
         toolbar_layout.addLayout(row1)
         toolbar_layout.addLayout(row2)
+        toolbar_layout.addWidget(entries_outer)
 
         device_header = QHBoxLayout()
         device_header.setSpacing(8)
@@ -409,14 +517,11 @@ class OtoolEsptoolUI(QMainWindow):
         pg0_layout.addLayout(device_header)
         pg0_layout.addWidget(scroll, 1)
 
-        # 页 1 — 熔丝台（暂空白）
+        # 页 1 — 熔丝台
         page_efuse = QWidget()
         pg1_layout = QVBoxLayout(page_efuse)
-        pg1_layout.setContentsMargins(0, 0, 0, 0)
-        _efuse_hint = QLabel("熔丝台 — 施工中")
-        _efuse_hint.setObjectName("emptyHint")
-        _efuse_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        pg1_layout.addWidget(_efuse_hint)
+        pg1_layout.setContentsMargins(0, 0, 0, 70)  # 底部留出浮动 tab 栏空间
+        pg1_layout.addWidget(self._efuse_batch_widget)
 
         # 页 2 — 校验台（暂空白）
         page_verify = QWidget()
@@ -437,6 +542,7 @@ class OtoolEsptoolUI(QMainWindow):
         self._init_floating_info_panel(central)
         self._init_floating_tab_panel(central)
         self._position_floating_panels()
+        self._add_flash_entry()  # 初始化第一条烧录条目
 
     def _init_floating_info_panel(self, parent: QWidget) -> None:
         self.floating_info_panel = QFrame(parent)
@@ -527,8 +633,12 @@ class OtoolEsptoolUI(QMainWindow):
     def _on_tab_changed(self, idx: int) -> None:
         self.hero_title.setText(self._TAB_TITLES[idx])
         is_flash = idx == 0
+        is_efuse = idx == 1
         self._flash_btns_group.setVisible(is_flash)
         self._flash_cfg_group.setVisible(is_flash)
+        self._flash_row2.setVisible(is_flash)
+        self._efuse_btns_group.setVisible(is_efuse)
+        self._efuse_row2.setVisible(is_efuse)
 
     def _apply_style(self) -> None:
         _arrow_path = str(TOOL_DIR / "src" / "assets" / "chevron_down.svg").replace("\\", "/")
@@ -843,6 +953,35 @@ class OtoolEsptoolUI(QMainWindow):
                 border-color: #1a4db5;
                 color: #ffffff;
             }
+            QPushButton#entryRemoveButton {
+                background: #fff0f0;
+                border: 1px solid #f5c0c0;
+                border-radius: 4px;
+                color: #991b1b;
+                font-size: 12px;
+                padding: 0px;
+                min-width: 26px;
+                max-width: 26px;
+            }
+            QPushButton#entryRemoveButton:hover {
+                background: #fee2e2;
+            }
+            QPushButton#entryRemoveButton:disabled {
+                background: #f5f5f5;
+                border-color: #e0e0e0;
+                color: #c0c0c0;
+            }
+            QPushButton#addEntryButton {
+                background: #f0f5ff;
+                border: 1px solid #c3d4f8;
+                border-radius: 6px;
+                color: #2560e0;
+                font-size: 12px;
+                padding: 3px 10px;
+            }
+            QPushButton#addEntryButton:hover {
+                background: #dce8ff;
+            }
             QScrollArea {
                 border: none;
                 background: transparent;
@@ -932,17 +1071,10 @@ class OtoolEsptoolUI(QMainWindow):
             _build_reference_notice(),
         )
 
-    def _auto_set_address_from_path(self, path: str) -> None:
-        """从固件文件名中提取烧录地址（如 _0x10000），有则更新地址栏，无则置 0x0。"""
-        stem = Path(path).stem
-        match = re.search(r'_(0[xX][0-9a-fA-F]+)$', stem)
-        if match:
-            self.address_edit.setText(match.group(1).lower())
-        else:
-            self.address_edit.setText("0x0")
-
     def auto_pick_firmware(self) -> None:
-        if self.bin_edit.text().strip() or not DEFAULT_FIRMWARE_DIR.exists():
+        if not self._flash_rows or self._flash_rows[0].path_edit.text().strip():
+            return
+        if not DEFAULT_FIRMWARE_DIR.exists():
             return
         # 优先选有十六进制地址标记的文件，其次所有 .bin，均按修改时间降序
         hex_stamped = sorted(
@@ -958,23 +1090,9 @@ class OtoolEsptoolUI(QMainWindow):
         candidates = hex_stamped or all_bins
         if candidates:
             chosen = str(candidates[0])
-            self.bin_edit.setText(chosen)
-            self._auto_set_address_from_path(chosen)
-
-    def browse_firmware(self) -> None:
-        start_dir = str(
-            DEFAULT_FIRMWARE_DIR if DEFAULT_FIRMWARE_DIR.exists() else TOOL_DIR
-        )
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "选择固件",
-            start_dir,
-            "Binary Files (*.bin);;All Files (*.*)",
-        )
-        if file_path:
-            self.bin_edit.setText(file_path)
-            self._auto_set_address_from_path(file_path)
-            self.status_label.setText("状态: 已更新公共固件文件")
+            first = self._flash_rows[0]
+            first.path_edit.setText(chosen)
+            first._auto_set_addr(chosen)
 
     def _sync_new_badge(self, device_id: str) -> None:
         card = self.device_cards.get(device_id)
@@ -1202,6 +1320,56 @@ class OtoolEsptoolUI(QMainWindow):
                 return match.group(1).strip()
         return ""
 
+    # ── 多条目烧录管理 ──────────────────────────────────────────
+
+    def _add_flash_entry(self, addr: str = "0x0", path: str = "") -> "FlashEntryRow":
+        row = FlashEntryRow(addr, path, parent=self._entries_inner)
+        row.remove_requested.connect(lambda r=row: self._remove_flash_entry(r))
+        self._flash_rows.append(row)
+        self._entries_vbox.addWidget(row)
+        self._update_remove_btns()
+        return row
+
+    def _remove_flash_entry(self, row: "FlashEntryRow") -> None:
+        if len(self._flash_rows) <= 1:
+            return
+        self._flash_rows.remove(row)
+        self._entries_vbox.removeWidget(row)
+        row.deleteLater()
+        self._update_remove_btns()
+
+    def _update_remove_btns(self) -> None:
+        can_remove = len(self._flash_rows) > 1
+        for r in self._flash_rows:
+            r.remove_btn.setEnabled(can_remove)
+
+    def _get_valid_flash_entries(self) -> "list[tuple[str, str]] | None":
+        """
+        校验所有烧录条目并返回 [(addr, path), ...]；任一条目不合法则弹窗并返回 None。
+        空行（地址和路径均为空）直接跳过。
+        """
+        entries: list[tuple[str, str]] = []
+        for row in self._flash_rows:
+            addr = row.addr_edit.text().strip()
+            path = row.path_edit.text().strip()
+            if not addr and not path:
+                continue
+            if not addr or not re.match(r'^0[xX][0-9a-fA-F]+$', addr):
+                QMessageBox.warning(
+                    self,
+                    "提示",
+                    f"烧录地址格式不正确：{addr!r}，应为十六进制如 0x0、0x10000。",
+                )
+                return None
+            if not path or not Path(path).is_file():
+                QMessageBox.warning(self, "提示", f"请选择有效的固件文件（当前：{path!r}）。")
+                return None
+            entries.append((addr, path))
+        if not entries:
+            QMessageBox.warning(self, "提示", "请至少填写一个有效的烧录条目。")
+            return None
+        return entries
+
     def _validate_common_inputs(self, require_bin: bool) -> bool:
         if not _tool_backend_available("esptool"):
             QMessageBox.critical(
@@ -1214,18 +1382,8 @@ class OtoolEsptoolUI(QMainWindow):
         if not baud_text.isdigit():
             QMessageBox.warning(self, "提示", "公共波特率必须是数字。")
             return False
-        addr = self.address_edit.text().strip()
-        if not addr:
-            QMessageBox.warning(self, "提示", "请输入公共烧录地址，例如 0x0。")
-            return False
-        if not re.match(r'^0[xX][0-9a-fA-F]+$', addr):
-            QMessageBox.warning(self, "提示", "烧录地址格式不正确，应为十六进制如 0x0、0x10000。")
-            return False
         if require_bin:
-            bin_path = Path(self.bin_edit.text().strip())
-            if not bin_path.is_file():
-                QMessageBox.warning(self, "提示", "请选择有效的 .bin 固件文件。")
-                return False
+            return self._get_valid_flash_entries() is not None
         return True
 
     def _build_esptool_base_args(self, device_id: str) -> list[str]:
@@ -1285,16 +1443,23 @@ class OtoolEsptoolUI(QMainWindow):
         )
 
     def flash_firmware(self, device_id: str, acknowledge: bool = True) -> None:
-        if not self._validate_common_inputs(require_bin=True):
+        entries = self._get_valid_flash_entries()
+        if entries is None:
+            return
+        if not _tool_backend_available("esptool"):
+            QMessageBox.critical(self, "错误", "未找到可用 esptool。")
+            return
+        baud_text = self.baud_edit.currentText().strip()
+        if not baud_text.isdigit():
+            QMessageBox.warning(self, "提示", "公共波特率必须是数字。")
             return
         if acknowledge:
             self._acknowledge_device(device_id)
         card = self.device_cards[device_id]
-        esptool_args = self._build_esptool_base_args(device_id) + [
-            "write-flash",
-            self.address_edit.text().strip(),
-            self.bin_edit.text().strip(),
-        ]
+        flash_pairs: list[str] = []
+        for addr, path in entries:
+            flash_pairs += [addr, path]
+        esptool_args = self._build_esptool_base_args(device_id) + ["write-flash"] + flash_pairs
         self._start_process(
             card,
             _build_tool_worker_command("esptool", *esptool_args),
@@ -1338,6 +1503,23 @@ class OtoolEsptoolUI(QMainWindow):
     def stop_all_devices(self) -> None:
         for port in list(self.device_cards):
             self.stop_process(port)
+
+    def clear_devices(self) -> None:
+        """移除所有设备卡片并重置 NEW 状态，下次刷新时所有设备重新判定为新设备。"""
+        for card in list(self.device_cards.values()):
+            if card.process is not None:
+                card.process.kill()
+                card.process = None
+            card.setParent(None)
+            card.deleteLater()
+        self.device_cards.clear()
+        self.device_infos.clear()
+        self.new_device_ids.clear()
+        self.acknowledged_device_ids.clear()
+        self._rebuild_device_grid()
+        self._update_stats()
+        self.device_count_label.setText("0 台")
+        self.status_label.setText("状态: 已清空，等待设备接入")
 
     def toggle_auto_refresh(self, enabled: bool) -> None:
         self.auto_refresh_button.setText(f"自动刷新: {'开' if enabled else '关'}")
