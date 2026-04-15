@@ -476,5 +476,7 @@ class DeviceCard(QFrame):
         self.new_badge.setVisible(is_new)
         if is_new:
             self.setProperty("cardState", "new")
-            self.style().unpolish(self)
-            self.style().polish(self)
+        elif self.property("cardState") == "new":
+            self.setProperty("cardState", "idle")
+        self.style().unpolish(self)
+        self.style().polish(self)

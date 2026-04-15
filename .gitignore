@@ -28,6 +28,7 @@ _gen_ico.py
 
 .idea/
 .vscode/
+.tools/
 
 .DS_Store
 Thumbs.db

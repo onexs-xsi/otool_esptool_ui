@@ -81,52 +81,7 @@ python otool_esptool_ui.py
 
 ## Packaging
 
-### 前提
-
-- Windows
-- 已激活虚拟环境（含 PyInstaller）
-- 已初始化 Git 子模块 `esptool/`
-
-### 安装打包依赖
-
-```powershell
-python -m pip install pyinstaller
-```
-
-### 执行打包
-
-> **注意**：使用 `python -m PyInstaller` 而非 `pyinstaller` 直接调用，避免 launcher 路径问题。
-
-```powershell
-python -m PyInstaller --clean -y otool_esptool_ui.spec
-```
-
-### 打包内容
-
-- 主程序 `otool_esptool_ui.py`（同时作为运行时版本号读取来源）
-- 本地 Git 子模块 `esptool/` 对应的 `esptool`、`espefuse`、`espsecure` 包
-- `bitstring`、`serial` 等运行时依赖
-- `THIRD_PARTY_NOTICES.md`、`config.yaml`、`assets/`、`logo_all_size.ico`
-- Windows 版本信息（由 spec 从 `__version__` 自动生成）
-
-### 输出结果
-
-```text
-dist/
-└─ otool_esptool_ui.exe   # 单文件 EXE，约 30–40 MB
-```
-
-## Version Management
-
-版本号只需修改 `otool_esptool_ui.py` 一处：
-
-```python
-__version__ = "0.1.1"
-```
-
-- **程序标题栏**：`constants.py` 在运行时从该文件（源码模式）或 `sys._MEIPASS/otool_esptool_ui.py`（冻结模式）读取
-- **EXE 文件属性**：`otool_esptool_ui.spec` 在构建时解析该值生成 `file_version_info.txt`
-- **`pyproject.toml`**：应与 `__version__` 手动保持一致
+Windows 下运行 `./management_tools.ps1` 可打开管理界面，支持选择 Python 版本、自动下载 Python zip 并初始化 `.venv`、删除环境、运行程序，以及执行打包生成单文件 `dist/otool_esptool_ui.exe`。
 
 ## License
 

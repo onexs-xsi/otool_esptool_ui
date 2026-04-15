@@ -244,6 +244,7 @@ class OtoolEsptoolUI(QMainWindow):
         self.device_cards: dict[str, DeviceCard] = {}
         self.device_infos: dict[str, DeviceInfo] = {}
         self.new_device_ids: set[str] = set()
+        self.acknowledged_device_ids: set[str] = set()
         self.refresh_timer = QTimer(self)
         self.refresh_timer.setInterval(2500)
         self.refresh_timer.timeout.connect(self.refresh_ports)
@@ -975,6 +976,22 @@ class OtoolEsptoolUI(QMainWindow):
             self._auto_set_address_from_path(file_path)
             self.status_label.setText("状态: 已更新公共固件文件")
 
+    def _sync_new_badge(self, device_id: str) -> None:
+        card = self.device_cards.get(device_id)
+        if card is None:
+            return
+        info = self.device_infos.get(device_id)
+        card.set_newly_detected(
+            device_id in self.new_device_ids
+            and device_id not in self.acknowledged_device_ids
+            and (info is None or info.connected)
+        )
+
+    def _acknowledge_device(self, device_id: str) -> None:
+        self.acknowledged_device_ids.add(device_id)
+        self.new_device_ids.discard(device_id)
+        self._sync_new_badge(device_id)
+
     def refresh_ports(self) -> None:
         previous_ids = set(self.device_cards)
         ports = []
@@ -1023,7 +1040,7 @@ class OtoolEsptoolUI(QMainWindow):
             self.device_infos[device.device_id] = device
             if device.device_id in self.device_cards:
                 self.device_cards[device.device_id].update_device(device)
-                self.device_cards[device.device_id].set_newly_detected(False)
+                self._sync_new_badge(device.device_id)
                 if self.device_cards[device.device_id].process is None:
                     self.device_cards[device.device_id].set_result_state("空闲", "idle")
             else:
@@ -1058,8 +1075,9 @@ class OtoolEsptoolUI(QMainWindow):
                     )
                 )
                 self.device_cards[device.device_id] = card
-                self.new_device_ids.add(device.device_id)
-                card.set_newly_detected(True)
+                if device.device_id not in self.acknowledged_device_ids:
+                    self.new_device_ids.add(device.device_id)
+                self._sync_new_badge(device.device_id)
                 if self._card_scale != 1.0:
                     card.apply_scale(self._card_scale)
                 if self.auto_flash_button.isChecked():
@@ -1223,7 +1241,7 @@ class OtoolEsptoolUI(QMainWindow):
             self.baud_edit.currentText().strip(),
         ]
 
-    def reset_device(self, device_id: str) -> None:
+    def reset_device(self, device_id: str, acknowledge: bool = True) -> None:
         if not _tool_backend_available("esptool"):
             QMessageBox.critical(self, "错误", "未找到可用 esptool。")
             return
@@ -1231,6 +1249,8 @@ class OtoolEsptoolUI(QMainWindow):
         if not baud_text.isdigit():
             QMessageBox.warning(self, "提示", "公共波特率必须是数字。")
             return
+        if acknowledge:
+            self._acknowledge_device(device_id)
         card = self.device_cards[device_id]
         esptool_args = self._build_esptool_base_args(device_id) + ["run"]
         self._start_process(
@@ -1243,9 +1263,11 @@ class OtoolEsptoolUI(QMainWindow):
             backend_text="内置 esptool API worker",
         )
 
-    def erase_flash(self, device_id: str) -> None:
+    def erase_flash(self, device_id: str, acknowledge: bool = True) -> None:
         if not self._validate_common_inputs(require_bin=False):
             return
+        if acknowledge:
+            self._acknowledge_device(device_id)
         card = self.device_cards[device_id]
         esptool_args = self._build_esptool_base_args(device_id) + [
             "erase-region",
@@ -1262,9 +1284,11 @@ class OtoolEsptoolUI(QMainWindow):
             backend_text="内置 esptool API worker",
         )
 
-    def flash_firmware(self, device_id: str) -> None:
+    def flash_firmware(self, device_id: str, acknowledge: bool = True) -> None:
         if not self._validate_common_inputs(require_bin=True):
             return
+        if acknowledge:
+            self._acknowledge_device(device_id)
         card = self.device_cards[device_id]
         esptool_args = self._build_esptool_base_args(device_id) + [
             "write-flash",
@@ -1293,7 +1317,7 @@ class OtoolEsptoolUI(QMainWindow):
             return
         if not self._validate_common_inputs(require_bin=True):
             return
-        self.flash_firmware(device_id)
+        self.flash_firmware(device_id, acknowledge=False)
 
     def erase_all_devices(self) -> None:
         if not self._validate_common_inputs(require_bin=False):
@@ -1554,6 +1578,7 @@ class OtoolEsptoolUI(QMainWindow):
         card = self.device_cards.get(device_id)
         if card is None or card.process is None:
             return
+        self._acknowledge_device(device_id)
         card.append_log("用户请求停止任务。")
         card.process.kill()
         card.set_result_state("已停止", "error")
@@ -1565,6 +1590,7 @@ class OtoolEsptoolUI(QMainWindow):
         info = self.device_infos.get(device_id)
         if info is None:
             return
+        self._acknowledge_device(device_id)
         baud = self.baud_edit.currentText().strip() or "115200"
         dlg = EFuseDialog(info, baud, parent=self)
         dlg.exec()
