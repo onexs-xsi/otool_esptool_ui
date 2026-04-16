@@ -77,6 +77,7 @@ from .efuse_batch_dialog import BurnEfuseBatchWidget
 from .efuse_dialog import EFuseDialog
 from .flow_layout import FlowLayout
 from .helpers import _build_avatar_icon, _build_github_icon, _fetch_remote_avatar_bytes
+from .merge_split_widget import MergeSplitWidget
 from .models import DeviceInfo
 from .styles import BASE_STYLESHEET
 
@@ -532,9 +533,20 @@ class OtoolEsptoolUI(QMainWindow):
         _verify_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         pg2_layout.addWidget(_verify_hint)
 
+        # 页 3 — 分合台
+        page_merge_split = QWidget()
+        pg3_layout = QVBoxLayout(page_merge_split)
+        pg3_layout.setContentsMargins(0, 0, 0, 70)
+        self._merge_split_widget = MergeSplitWidget()
+        self._merge_split_widget.send_to_flash_station.connect(
+            self._receive_merged_firmware
+        )
+        pg3_layout.addWidget(self._merge_split_widget)
+
         self.page_stack.addWidget(page_flash)
         self.page_stack.addWidget(page_efuse)
         self.page_stack.addWidget(page_verify)
+        self.page_stack.addWidget(page_merge_split)
 
         root_layout.addWidget(toolbar)
         root_layout.addWidget(self.page_stack, 1)
@@ -595,7 +607,7 @@ class OtoolEsptoolUI(QMainWindow):
         layout = QHBoxLayout(panel)
         layout.setContentsMargins(6, 4, 6, 4)
         layout.setSpacing(0)
-        self.tab_switcher = TabSwitcher(["烧录台", "熔丝台", "校验台"], panel)
+        self.tab_switcher = TabSwitcher(["烧录台", "熔丝台", "校验台", "分合台"], panel)
         self.tab_switcher.currentChanged.connect(self.page_stack.setCurrentIndex)
         self.tab_switcher.currentChanged.connect(self._on_tab_changed)
         layout.addWidget(self.tab_switcher)
@@ -628,7 +640,7 @@ class OtoolEsptoolUI(QMainWindow):
     def _position_floating_info_panel(self) -> None:
         self._position_floating_panels()
 
-    _TAB_TITLES = ["烧录台", "熔丝台", "校验台"]
+    _TAB_TITLES = ["烧录台", "熔丝台", "校验台", "分合台"]
 
     def _on_tab_changed(self, idx: int) -> None:
         self.hero_title.setText(self._TAB_TITLES[idx])
@@ -639,6 +651,15 @@ class OtoolEsptoolUI(QMainWindow):
         self._flash_row2.setVisible(is_flash)
         self._efuse_btns_group.setVisible(is_efuse)
         self._efuse_row2.setVisible(is_efuse)
+
+    def _receive_merged_firmware(self, output_path: str) -> None:
+        """从分合台接收合成文件，跳转到烧录台并将其填入烧录条目。"""
+        if self.tab_switcher.current() != 0:
+            self.tab_switcher.set_current(0)
+        if self._flash_rows:
+            row = self._flash_rows[0]
+            row.path_edit.setText(output_path)
+            row.addr_edit.setText("0x0")
 
     def _apply_style(self) -> None:
         _arrow_path = str(TOOL_DIR / "src" / "assets" / "chevron_down.svg").replace("\\", "/")
@@ -1006,6 +1027,51 @@ class OtoolEsptoolUI(QMainWindow):
                 color: #9aa5bc;
                 font-size: 14px;
                 padding: 40px 12px;
+            }
+            QFrame#mergeSplitFrame {
+                background: #ffffff;
+                border: 1px solid #e0e4ea;
+                border-radius: 10px;
+            }
+            QTableWidget {
+                background: #ffffff;
+                alternate-background-color: #f6f8fb;
+                border: 1px solid #e0e4ea;
+                border-radius: 8px;
+                gridline-color: transparent;
+                outline: 0;
+                font-size: 13px;
+            }
+            QTableWidget::item {
+                padding: 5px 8px;
+                border: none;
+            }
+            QTableWidget::item:selected {
+                background: #dbeafe;
+                color: #1d4ed8;
+            }
+            QHeaderView::section {
+                background: #f0f3f9;
+                color: #6b7a94;
+                font-size: 11px;
+                font-weight: 700;
+                letter-spacing: 0.5px;
+                padding: 4px 8px;
+                border: none;
+                border-bottom: 1px solid #e0e4ea;
+            }
+            QHeaderView::section:first {
+                border-top-left-radius: 8px;
+            }
+            QHeaderView::section:last {
+                border-top-right-radius: 8px;
+            }
+            QTableWidget QPushButton {
+                font-size: 13px;
+                padding: 0px 6px;
+                border-radius: 5px;
+                min-height: 28px;
+                max-height: 28px;
             }
             QComboBox {
                 background: #f8f9fb;
