@@ -17,3 +17,82 @@ efuse_presets:
         将 USB_PHY_SEL eFuse 置 1，内置 USB PHY 改为连接
         USB OTG 1.1（使用 GPIO26/27），USB Device 原通道（GPIO24/25）
         将切换至外置 PHY。此 eFuse 操作不可逆，请确认设备型号后再烧录。
+
+# verify_profiles: 校验台脚本配置（键为脚本名）
+# 支持步骤：
+#   - action: reset        # 复位设备（method: serial_toggle | esptool_run | none）
+#   - action: wait         # 等待若干毫秒（duration_ms）
+#   - action: wait_silence # 等待串口静默一段时间（duration_ms / timeout_ms）
+#   - action: send_text    # 向串口发送文本（text / append_newline / char_delay_ms）
+#   - action: expect       # 等待匹配字段（patterns / timeout_ms / match_mode / match_type）
+#   - action: capture      # 从输出中读取参数（patterns[].name / group / timeout_ms）
+#   - action: set_result   # 用模板设置设备结果展示（text，支持 {{param}}）
+#   - action: pass         # 主动结束并标记通过（text 可选，支持 {{param}}）
+#   - action: fail         # 主动结束并标记失败（text 可选，支持 {{param}}）
+#   - action: clear_buffer # 清空当前缓冲区，便于做下一阶段判断
+# 通用字段：
+#   retry_count / retry_delay_ms  # 步骤失败后的重试次数与重试间隔
+# expect 说明：
+#   match_mode: all | any | none
+#   match_type: contains | regex
+# capture 说明：
+#   patterns 中建议填写 name，regex 时可用 group 指定捕获组
+
+verify_profiles:
+  默认启动日志校验:
+    description: >-
+      复位后等待启动日志，先检查启动关键字，再通过串口发送 version 命令读取版本号。
+      若设备不支持 RTS 复位，可将 reset.method 改成 esptool_run。
+    serial:
+      baudrate: 115200
+      bytesize: 8
+      parity: N
+      stopbits: 1
+      timeout_ms: 80
+      encoding: utf-8
+      newline: "\r\n"
+      max_buffer_chars: 20000
+    steps:
+      - action: reset
+        label: 复位设备并捕获启动日志
+        method: serial_toggle
+      - action: expect
+        label: 检查启动日志
+        timeout_ms: 5000
+        match_mode: all
+        match_type: contains
+        patterns:
+          - "boot:"
+          - "rst:"
+      - action: clear_buffer
+        label: 清空已读日志
+      - action: wait
+        label: 等待命令行准备
+        duration_ms: 300
+      - action: send_text
+        label: 发送 version 命令
+        text: version
+        append_newline: true
+      - action: wait_silence
+        label: 等待版本输出结束
+        duration_ms: 200
+        timeout_ms: 1500
+      - action: capture
+        label: 读取版本号
+        timeout_ms: 3000
+        match_mode: any
+        match_type: regex
+        retry_count: 1
+        retry_delay_ms: 150
+        patterns:
+          - name: version
+            pattern: 'version[:= ]+([^\r\n]+)'
+            group: 1
+            description: 版本号
+          - name: version
+            pattern: 'app version[:= ]+([^\r\n]+)'
+            group: 1
+            description: APP 版本号
+      - action: set_result
+        label: 显示版本读取结果
+        text: '版本={{version}}'

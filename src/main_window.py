@@ -80,6 +80,7 @@ from .helpers import _build_avatar_icon, _build_github_icon, _fetch_remote_avata
 from .merge_split_widget import MergeSplitWidget
 from .models import DeviceInfo
 from .styles import BASE_STYLESHEET
+from .verify_widget import VerifyWidget
 
 
 class TabSwitcher(QWidget):
@@ -329,6 +330,7 @@ class OtoolEsptoolUI(QMainWindow):
 
         # 页 1 — 熔丝台（提前创建，供 toolbar 引用其控件）
         self._efuse_batch_widget = BurnEfuseBatchWidget()
+        self._verify_widget = VerifyWidget()
 
         # ── 顶部工具栏 ─────────────────────────────────────
         toolbar = QFrame()
@@ -372,6 +374,7 @@ class OtoolEsptoolUI(QMainWindow):
         self.stop_all_button.setObjectName("dangerButton")
         self.stop_all_button.clicked.connect(self.stop_all_devices)
         self.stop_all_button.clicked.connect(self._efuse_batch_widget._stop_all)
+        self.stop_all_button.clicked.connect(self._verify_widget.stop_all_tasks)
 
         row1.addWidget(title)
         row1.addSpacing(12)
@@ -527,11 +530,8 @@ class OtoolEsptoolUI(QMainWindow):
         # 页 2 — 校验台（暂空白）
         page_verify = QWidget()
         pg2_layout = QVBoxLayout(page_verify)
-        pg2_layout.setContentsMargins(0, 0, 0, 0)
-        _verify_hint = QLabel("校验台 — 施工中")
-        _verify_hint.setObjectName("emptyHint")
-        _verify_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        pg2_layout.addWidget(_verify_hint)
+        pg2_layout.setContentsMargins(0, 0, 0, 70)
+        pg2_layout.addWidget(self._verify_widget)
 
         # 页 3 — 分合台
         page_merge_split = QWidget()
@@ -651,6 +651,13 @@ class OtoolEsptoolUI(QMainWindow):
         self._flash_row2.setVisible(is_flash)
         self._efuse_btns_group.setVisible(is_efuse)
         self._efuse_row2.setVisible(is_efuse)
+        for widget in (
+            self.total_stat,
+            self.running_stat,
+            self.success_stat,
+            self.failed_stat,
+        ):
+            widget.setVisible(is_flash)
 
     def _receive_merged_firmware(self, output_path: str) -> None:
         """从分合台接收合成文件，跳转到烧录台并将其填入烧录条目。"""
@@ -2039,6 +2046,8 @@ class OtoolEsptoolUI(QMainWindow):
                 event.ignore()
                 return
         self.stop_all_devices()
+        self._efuse_batch_widget._stop_all()
+        self._verify_widget.stop_all_tasks()
         super().closeEvent(event)
 
     def keyPressEvent(self, event) -> None:
