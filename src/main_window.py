@@ -31,7 +31,6 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
-    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -72,9 +71,11 @@ from .constants import (
     _tool_backend_available,
     resolve_chip_arg,
 )
+from .dialog_memory import get_existing_directory, get_open_file_name
 from .device_card import DeviceCard
 from .efuse_batch_dialog import BurnEfuseBatchWidget
 from .efuse_dialog import EFuseDialog
+from .export_dialog import ExportFlashDialog
 from .flow_layout import FlowLayout
 from .helpers import _build_avatar_icon, _build_github_icon, _fetch_remote_avatar_bytes
 from .merge_split_widget import MergeSplitWidget
@@ -283,13 +284,9 @@ class FlashEntryRow(QWidget):
         lay.addWidget(self.remove_btn)
 
     def _browse(self) -> None:
-        start_dir = str(
-            DEFAULT_FIRMWARE_DIR if DEFAULT_FIRMWARE_DIR.exists() else TOOL_DIR
-        )
-        file_path, _ = QFileDialog.getOpenFileName(
+        file_path, _ = get_open_file_name(
             self,
             "选择固件",
-            start_dir,
             "Binary Files (*.bin);;All Files (*.*)",
         )
         if file_path:
@@ -1237,21 +1234,28 @@ class OtoolEsptoolUI(QMainWindow):
             else:
                 card = DeviceCard(device)
                 card.erase_button.clicked.connect(
-                    lambda _checked=False, device_id=device.device_id: self.erase_flash(
-                        device_id
+                    lambda _checked=False,
+                    device_id=device.device_id: self._handle_device_action(
+                        device_id, "erase"
                     )
                 )
                 card.flash_button.clicked.connect(
                     lambda _checked=False,
-                    device_id=device.device_id: self.flash_firmware(device_id)
-                )
-                card.stop_button.clicked.connect(
-                    lambda _checked=False,
-                    device_id=device.device_id: self.stop_process(device_id)
+                    device_id=device.device_id: self._handle_device_action(
+                        device_id, "flash"
+                    )
                 )
                 card.reset_button.clicked.connect(
                     lambda _checked=False,
-                    device_id=device.device_id: self.reset_device(device_id)
+                    device_id=device.device_id: self._handle_device_action(
+                        device_id, "reset"
+                    )
+                )
+                card.export_button.clicked.connect(
+                    lambda _checked=False,
+                    device_id=device.device_id: self._handle_device_action(
+                        device_id, "export"
+                    )
                 )
                 card.efuse_button.clicked.connect(
                     lambda _checked=False,
@@ -1472,6 +1476,31 @@ class OtoolEsptoolUI(QMainWindow):
             self.baud_edit.currentText().strip(),
         ]
 
+    def _handle_device_action(self, device_id: str, action: str) -> None:
+        card = self.device_cards.get(device_id)
+        if card is not None and card.process is not None:
+            self.stop_process(device_id)
+            return
+        if action == "erase":
+            self.erase_flash(device_id)
+        elif action == "flash":
+            self.flash_firmware(device_id)
+        elif action == "reset":
+            self.reset_device(device_id)
+        elif action == "export":
+            self.export_firmware(device_id)
+
+    @staticmethod
+    def _normalize_read_flash_size(size: str) -> str:
+        value = size.strip()
+        if value.lower() == "all":
+            return "ALL"
+        if value.endswith("m"):
+            return value[:-1] + "M"
+        if value.endswith("K"):
+            return value[:-1] + "k"
+        return value
+
     def reset_device(self, device_id: str, acknowledge: bool = True) -> None:
         if not _tool_backend_available("esptool"):
             QMessageBox.critical(self, "错误", "未找到可用 esptool。")
@@ -1488,6 +1517,63 @@ class OtoolEsptoolUI(QMainWindow):
             card,
             _build_tool_worker_command("esptool", *esptool_args),
             "正在复位",
+            active_action="reset",
+            display_command=subprocess.list2cmdline(
+                _build_tool_command("esptool", *esptool_args)
+            ),
+            backend_text="内置 esptool API worker",
+        )
+
+    def export_firmware(self, device_id: str, acknowledge: bool = True) -> None:
+        if not _tool_backend_available("esptool"):
+            QMessageBox.critical(self, "错误", "未找到可用 esptool。")
+            return
+        baud_text = self.baud_edit.currentText().strip()
+        if not baud_text.isdigit():
+            QMessageBox.warning(self, "提示", "公共波特率必须是数字。")
+            return
+        info = self.device_infos.get(device_id)
+        card = self.device_cards.get(device_id)
+        if info is None or card is None:
+            return
+
+        dlg = ExportFlashDialog(info, baud_text, parent=self)
+        if not dlg.exec():
+            return
+        config = dlg.export_config()
+
+        output_dir = get_existing_directory(
+            self,
+            "选择导出目录",
+        )
+        if not output_dir:
+            return
+        output_path = Path(output_dir) / config.filename
+        if output_path.exists():
+            reply = QMessageBox.question(
+                self,
+                "确认覆盖",
+                f"文件已存在，是否覆盖？\n\n{output_path}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        if acknowledge:
+            self._acknowledge_device(device_id)
+        size_arg = self._normalize_read_flash_size(config.size)
+        esptool_args = self._build_esptool_base_args(device_id) + [
+            "read-flash",
+            config.address,
+            size_arg,
+            str(output_path),
+        ]
+        self._start_process(
+            card,
+            _build_tool_worker_command("esptool", *esptool_args),
+            "正在导出",
+            active_action="export",
             display_command=subprocess.list2cmdline(
                 _build_tool_command("esptool", *esptool_args)
             ),
@@ -1509,6 +1595,7 @@ class OtoolEsptoolUI(QMainWindow):
             card,
             _build_tool_worker_command("esptool", *esptool_args),
             "正在擦除",
+            active_action="erase",
             display_command=subprocess.list2cmdline(
                 _build_tool_command("esptool", *esptool_args)
             ),
@@ -1537,6 +1624,7 @@ class OtoolEsptoolUI(QMainWindow):
             card,
             _build_tool_worker_command("esptool", *esptool_args),
             "正在烧录",
+            active_action="flash",
             display_command=subprocess.list2cmdline(
                 _build_tool_command("esptool", *esptool_args)
             ),
@@ -1610,6 +1698,7 @@ class OtoolEsptoolUI(QMainWindow):
         card: DeviceCard,
         command: list[str],
         busy_text: str,
+        active_action: str | None = None,
         display_command: str | None = None,
         backend_text: str | None = None,
         _is_retry: bool = False,
@@ -1624,6 +1713,7 @@ class OtoolEsptoolUI(QMainWindow):
         card._last_command = list(command)
         card._last_command_meta = {
             "busy_text": busy_text,
+            "active_action": active_action,
             "display_command": display_command,
             "backend_text": backend_text,
         }
@@ -1659,9 +1749,11 @@ class OtoolEsptoolUI(QMainWindow):
         process.errorOccurred.connect(
             lambda error, did=card.device.device_id: self._process_error(did, error)
         )
-        card.set_running_state(busy_text, True)
+        card.set_running_state(busy_text, True, active_action=active_action)
         initial_stage_text = ""
-        if "write-flash" in command:
+        if "read-flash" in command or "read_flash" in command:
+            initial_stage_text = "准备导出 Flash"
+        elif "write-flash" in command:
             initial_stage_text = "准备连接设备"
         elif "erase-region" in command:
             initial_stage_text = "准备擦除 Flash"
@@ -1730,6 +1822,8 @@ class OtoolEsptoolUI(QMainWindow):
             percent = int(event.get("percent", 0) or 0)
             prefix = str(event.get("prefix", "") or "执行中")
             suffix = str(event.get("suffix", "") or "")
+            if "reading from" in prefix.lower():
+                prefix = "正在导出 Flash"
             if total > 0:
                 percent = max(0, min(100, percent))
             progress_text = " ".join(part for part in [prefix.strip(), f"{percent}%", suffix.strip()] if part)
@@ -1751,6 +1845,8 @@ class OtoolEsptoolUI(QMainWindow):
             (r"detecting chip type", "正在识别芯片"),
             (r"features:", "正在读取芯片特性"),
             (r"changing baud rate", "正在切换波特率"),
+            (r"reading from", "正在导出 Flash"),
+            (r"read \d+ bytes from", "导出完成"),
             (r"erasing flash", "正在擦除 Flash"),
             (r"erase completed", "擦除完成"),
             (r"flash will be erased", "准备擦除目标区域"),
@@ -1787,9 +1883,11 @@ class OtoolEsptoolUI(QMainWindow):
                 card.set_progress(max(current, 8), stage_text)
             elif stage_text in {"准备擦除 Flash", "准备擦除目标区域", "正在擦除 Flash"}:
                 card.set_progress(max(current, 15), stage_text)
+            elif stage_text == "正在导出 Flash":
+                card.set_progress(max(current, 15), stage_text)
             elif stage_text in {"擦除完成", "正在写入 Flash"}:
                 card.set_progress(max(current, 55), stage_text)
-            elif stage_text in {"写入完成，等待校验", "校验成功"}:
+            elif stage_text in {"写入完成，等待校验", "校验成功", "导出完成"}:
                 card.set_progress(max(current, 92), stage_text)
             elif stage_text == "正在复位设备":
                 card.set_progress(max(current, 97), stage_text)
@@ -1807,7 +1905,12 @@ class OtoolEsptoolUI(QMainWindow):
         card.append_log(f"[状态] 进程已结束，退出码: {exit_code}")
         if exit_code == 0:
             card.append_log("任务完成。")
-            card.set_result_state("执行成功", "success")
+            success_text = (
+                "导出成功"
+                if card._last_command_meta.get("active_action") == "export"
+                else "执行成功"
+            )
+            card.set_result_state(success_text, "success")
             self._update_device_info_from_log(card, device_id)
         else:
             if self._try_auto_retry(card, device_id):
@@ -1912,6 +2015,7 @@ class OtoolEsptoolUI(QMainWindow):
             card,
             _build_tool_worker_command("espefuse", *espefuse_args),
             f"烧录中 ({efuse_name})",
+            active_action="flash",
             display_command=subprocess.list2cmdline(
                 _build_tool_command("espefuse", *espefuse_args)
             ),
@@ -1956,6 +2060,7 @@ class OtoolEsptoolUI(QMainWindow):
                 card,
                 new_cmd,
                 meta.get("busy_text", "重试中"),
+                active_action=meta.get("active_action"),
                 display_command=new_display or None,
                 backend_text=meta.get("backend_text"),
                 _is_retry=True,

@@ -17,7 +17,6 @@ from PyQt6.QtGui import QColor, QFont, QTextCursor
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
-    QFileDialog,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -44,6 +43,7 @@ from .constants import (
     _tool_backend_available,
     resolve_chip_arg,
 )
+from .dialog_memory import get_open_file_name
 from .styles import BASE_STYLESHEET
 
 # ── 动态芯片列表（来自 esptool，不硬编码）───────────────────────────────────
@@ -417,10 +417,9 @@ class BurnEfuseBatchWidget(QWidget):
 
     def _import_from_presets(self) -> None:
         """打开文件选择器，加载 YAML 文件中的 eFuse 字段配置。"""
-        path, _ = QFileDialog.getOpenFileName(
+        path, _ = get_open_file_name(
             self,
             "选择 eFuse 配置文件",
-            str(TOOL_DIR),
             "YAML 文件 (*.yaml *.yml);;All Files (*)",
         )
         if not path:

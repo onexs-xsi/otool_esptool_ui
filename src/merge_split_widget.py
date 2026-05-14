@@ -18,7 +18,6 @@ from PyQt6.QtGui import QFont, QTextCursor
 from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
-    QFileDialog,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -40,12 +39,12 @@ from PyQt6.QtWidgets import (
 )
 
 from .constants import (
-    DEFAULT_FIRMWARE_DIR,
     TOOL_DIR,
     _build_tool_command,
     _inject_local_esptool_pythonpath,
     _tool_backend_available,
 )
+from .dialog_memory import get_existing_directory, get_open_file_name, get_save_file_name
 
 # ── 动态芯片列表 ─────────────────────────────────────────────────────────────
 try:
@@ -349,7 +348,7 @@ class _FsViewerDialog(QDialog):
         if not items:
             QMessageBox.information(self, "提示", "请先选择要提取的文件（非目录）。")
             return
-        out_dir = QFileDialog.getExistingDirectory(self, "选择输出目录")
+        out_dir = get_existing_directory(self, "选择输出目录")
         if not out_dir:
             return
         out = Path(out_dir)
@@ -365,7 +364,7 @@ class _FsViewerDialog(QDialog):
     def _extract_all(self) -> None:
         if self._fs is None:
             return
-        out_dir = QFileDialog.getExistingDirectory(self, "选择输出目录")
+        out_dir = get_existing_directory(self, "选择输出目录")
         if not out_dir:
             return
         out = Path(out_dir)
@@ -437,9 +436,8 @@ class _EntryRow(QWidget):
         lay.addWidget(self.remove_btn)
 
     def _browse(self) -> None:
-        start = str(DEFAULT_FIRMWARE_DIR if DEFAULT_FIRMWARE_DIR.exists() else TOOL_DIR)
-        fp, _ = QFileDialog.getOpenFileName(
-            self, "选择固件", start, "Binary Files (*.bin);;All Files (*.*)",
+        fp, _ = get_open_file_name(
+            self, "选择固件", "Binary Files (*.bin);;All Files (*.*)",
         )
         if fp:
             self.path_edit.setText(fp)
@@ -738,15 +736,14 @@ class MergeSplitWidget(QWidget):
     # ═════════════════════════════════════════════════════════════════════════
 
     def _split_browse_input(self) -> None:
-        start = str(DEFAULT_FIRMWARE_DIR if DEFAULT_FIRMWARE_DIR.exists() else TOOL_DIR)
-        fp, _ = QFileDialog.getOpenFileName(
-            self, "选择合并固件", start, "Binary Files (*.bin);;All Files (*.*)",
+        fp, _ = get_open_file_name(
+            self, "选择合并固件", "Binary Files (*.bin);;All Files (*.*)",
         )
         if fp:
             self._split_input_edit.setText(fp)
 
     def _split_browse_output(self) -> None:
-        d = QFileDialog.getExistingDirectory(self, "选择输出目录")
+        d = get_existing_directory(self, "选择输出目录")
         if d:
             self._split_output_edit.setText(d)
 
@@ -987,13 +984,9 @@ class MergeSplitWidget(QWidget):
         off, sz = row["offset"], row["size"]
         default_name = f"{row['name']}_{off:#010x}.bin"
         # 总是弹出另存为对话框，让用户自己决定保存位置
-        default_dir = self._split_output_edit.text().strip()
-        if not default_dir:
-            inp = self._split_input_edit.text().strip()
-            default_dir = str(Path(inp).parent) if inp else str(Path.cwd())
-        save_path, _ = QFileDialog.getSaveFileName(
+        save_path, _ = get_save_file_name(
             self, "保存提取文件",
-            str(Path(default_dir) / default_name),
+            default_name,
             "Binary Files (*.bin);;All Files (*.*)",
         )
         if not save_path:
@@ -1011,9 +1004,7 @@ class MergeSplitWidget(QWidget):
         # 若未设置输出目录，弹窗选择并写回字段
         out_str = self._split_output_edit.text().strip()
         if not out_str:
-            inp = self._split_input_edit.text().strip()
-            default = str(Path(inp).parent / (Path(inp).stem + "_split")) if inp else str(Path.cwd())
-            chosen = QFileDialog.getExistingDirectory(self, "选择输出目录", default)
+            chosen = get_existing_directory(self, "选择输出目录")
             if not chosen:
                 return
             self._split_output_edit.setText(chosen)
@@ -1061,10 +1052,7 @@ class MergeSplitWidget(QWidget):
 
     def _merge_load_flash_args(self) -> None:
         """读取 ESP-IDF build 目录中的 flash_args 或 flasher_args.json，填充条目和参数。"""
-        start = str(DEFAULT_FIRMWARE_DIR if DEFAULT_FIRMWARE_DIR.exists() else TOOL_DIR)
-        chosen = QFileDialog.getExistingDirectory(
-            self, "选择 ESP-IDF build 目录", start,
-        )
+        chosen = get_existing_directory(self, "选择 ESP-IDF build 目录")
         if not chosen:
             return
         build_dir = Path(chosen)
@@ -1166,11 +1154,10 @@ class MergeSplitWidget(QWidget):
         self._append_log(f"共 {len(entries)} 个条目。")
 
     def _merge_browse_output(self) -> None:
-        start = str(DEFAULT_FIRMWARE_DIR if DEFAULT_FIRMWARE_DIR.exists() else TOOL_DIR)
         fmt = self._merge_fmt_combo.currentText()
         ext_map = {"raw": "Binary Files (*.bin)", "uf2": "UF2 Files (*.uf2)", "hex": "Hex Files (*.hex)"}
-        fp, _ = QFileDialog.getSaveFileName(
-            self, "保存合成文件", start,
+        fp, _ = get_save_file_name(
+            self, "保存合成文件", "",
             f"{ext_map.get(fmt, 'All Files (*.*)')};;All Files (*.*)",
         )
         if fp:
@@ -1212,9 +1199,8 @@ class MergeSplitWidget(QWidget):
             fmt = self._merge_fmt_combo.currentText()
             ext_map = {"raw": ".bin", "uf2": ".uf2", "hex": ".hex"}
             ext = ext_map.get(fmt, ".bin")
-            start_dir = str(DEFAULT_FIRMWARE_DIR if DEFAULT_FIRMWARE_DIR.exists() else TOOL_DIR)
-            save_path, _ = QFileDialog.getSaveFileName(
-                self, "选择输出文件", str(Path(start_dir) / f"merged{ext}"),
+            save_path, _ = get_save_file_name(
+                self, "选择输出文件", f"merged{ext}",
                 f"{fmt.upper()} Files (*{ext});;All Files (*.*)",
             )
             if not save_path:

@@ -72,6 +72,11 @@ QPushButton#primaryButton {
 QPushButton#primaryButton:hover {
     background: #1a4db5;
 }
+QPushButton#primaryButton:disabled {
+    background: #f5f6f8;
+    color: #b0b8cd;
+    border-color: #e8eaef;
+}
 QPushButton#dangerButton {
     background: #fff5f5;
     border: 1px solid #e53935;
@@ -79,6 +84,11 @@ QPushButton#dangerButton {
 }
 QPushButton#dangerButton:hover {
     background: #fee2e2;
+}
+QPushButton#dangerButton:disabled {
+    background: #f5f6f8;
+    color: #b0b8cd;
+    border-color: #e8eaef;
 }
 QPushButton:disabled {
     background: #f5f6f8;

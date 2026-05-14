@@ -13,7 +13,6 @@ from PyQt6.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QSyntaxHighlighter, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
     QComboBox,
-    QFileDialog,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -32,6 +31,7 @@ from PyQt6.QtWidgets import (
 from serial.tools import list_ports
 
 from .constants import TOOL_DIR, _build_process_env_dict, _build_tool_command
+from .dialog_memory import get_open_file_name, get_save_file_name
 from .styles import BASE_STYLESHEET
 from .verify_plan import (
     DEFAULT_VERIFY_PROFILE_NAME,
@@ -1195,10 +1195,9 @@ class VerifyWidget(QWidget):
         self._set_profile_to_editors(profile)
 
     def _import_profiles(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
+        path, _ = get_open_file_name(
             self,
             "选择检验脚本 YAML",
-            str(TOOL_DIR),
             "YAML 文件 (*.yaml *.yml);;All Files (*)",
         )
         if not path:
@@ -1218,10 +1217,10 @@ class VerifyWidget(QWidget):
         profile = self._validate_current_profile()
         if profile is None:
             return
-        save_path, _ = QFileDialog.getSaveFileName(
+        save_path, _ = get_save_file_name(
             self,
             "导出检验脚本",
-            str(TOOL_DIR / f"{profile.name}.yaml"),
+            f"{profile.name}.yaml",
             "YAML 文件 (*.yaml *.yml)",
         )
         if not save_path:

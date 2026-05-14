@@ -139,6 +139,71 @@ class ElidedLabel(QLabel):
         )
 
 
+class SplitTextProgressBar(QProgressBar):
+    """进度文字按填充边界自动分色，避免蓝色进度块盖住深色文字。"""
+
+    _BG = QColor("#eef0f5")
+    _FILL = QColor("#2560e0")
+    _TEXT_ON_FILL = QColor("#ffffff")
+    _TEXT_ON_BG = QColor("#2560e0")
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setTextVisible(True)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        radius = min(5.0, rect.height() / 2.0)
+        bar_path = QPainterPath()
+        bar_path.addRoundedRect(rect, radius, radius)
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(self._BG)
+        painter.drawPath(bar_path)
+
+        minimum = self.minimum()
+        maximum = self.maximum()
+        if maximum > minimum:
+            ratio = (self.value() - minimum) / (maximum - minimum)
+        else:
+            ratio = 0.0
+        ratio = max(0.0, min(1.0, ratio))
+        fill_width = rect.width() * ratio
+
+        if fill_width > 0.0:
+            fill_clip = QPainterPath()
+            fill_clip.addRect(QRectF(rect.x(), rect.y(), fill_width, rect.height()))
+            painter.setClipPath(bar_path.intersected(fill_clip))
+            painter.setBrush(self._FILL)
+            painter.drawPath(bar_path)
+
+        text = self.text() if self.isTextVisible() else ""
+        if text:
+            text_rect = self.rect()
+            if fill_width > 0.0:
+                fill_clip = QPainterPath()
+                fill_clip.addRect(QRectF(rect.x(), rect.y(), fill_width, rect.height()))
+                painter.setClipPath(bar_path.intersected(fill_clip))
+                painter.setPen(self._TEXT_ON_FILL)
+                painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, text)
+            if fill_width < rect.width():
+                bg_clip = QPainterPath()
+                bg_clip.addRect(QRectF(
+                    rect.x() + fill_width,
+                    rect.y(),
+                    rect.width() - fill_width,
+                    rect.height(),
+                ))
+                painter.setClipPath(bar_path.intersected(bg_clip))
+                painter.setPen(self._TEXT_ON_BG)
+                painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, text)
+
+        painter.end()
+
+
 class DeviceCard(QFrame):
     _BASE_WIDTH = 380
     _BASE_LOG_HEIGHT = 200
@@ -176,7 +241,7 @@ class DeviceCard(QFrame):
         self.new_badge.hide()
         self.port_badge = QLabel()
         self.port_badge.setObjectName("portBadge")
-        self.title_label = QLabel()
+        self.title_label = ElidedLabel()
         self.title_label.setObjectName("deviceTitle")
         self.summary_label = QLabel()
         self.summary_label.setObjectName("deviceSummary")
@@ -246,24 +311,30 @@ class DeviceCard(QFrame):
         action_layout.setSpacing(8)
 
         self.erase_button = QPushButton("擦除")
+        self.erase_button.setObjectName("primaryButton")
         self.flash_button = QPushButton("烧录")
         self.flash_button.setObjectName("primaryButton")
-        self.stop_button = QPushButton("停止")
-        self.stop_button.setObjectName("dangerButton")
-        self.stop_button.setEnabled(False)
         self.reset_button = QPushButton("复位")
-        self.reset_button.setObjectName("resetButton")
+        self.reset_button.setObjectName("primaryButton")
+        self.export_button = QPushButton("导出")
+        self.export_button.setObjectName("primaryButton")
         self.efuse_button = QPushButton("eFuse")
         self.efuse_button.setObjectName("efuseButton")
+        self._action_buttons = [
+            ("erase", self.erase_button, "擦除"),
+            ("flash", self.flash_button, "烧录"),
+            ("reset", self.reset_button, "复位"),
+            ("export", self.export_button, "导出"),
+        ]
 
         action_layout.addWidget(self.erase_button)
         action_layout.addWidget(self.flash_button)
-        action_layout.addWidget(self.stop_button)
         action_layout.addWidget(self.reset_button)
+        action_layout.addWidget(self.export_button)
         action_layout.addStretch(1)
         action_layout.addWidget(self.efuse_button)
 
-        self.progress_bar = QProgressBar()
+        self.progress_bar = SplitTextProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(True)
@@ -414,7 +485,29 @@ class DeviceCard(QFrame):
         if at_bottom:
             sb.setValue(sb.maximum())
 
-    def set_running_state(self, text: str, running: bool) -> None:
+    def _set_action_button_mode(
+        self,
+        stop_mode: bool,
+        enabled: bool = True,
+        active_action: str | None = None,
+    ) -> None:
+        """切换擦除/烧录/复位三颗主操作按钮的空闲态与停止态。"""
+        for action, button, idle_text in self._action_buttons:
+            is_active = stop_mode and action == active_action
+            target_name = "dangerButton" if is_active else "primaryButton"
+            button.setText("停止" if is_active else idle_text)
+            if button.objectName() != target_name:
+                button.setObjectName(target_name)
+                button.style().unpolish(button)
+                button.style().polish(button)
+            button.setEnabled(enabled if not stop_mode else is_active)
+
+    def set_running_state(
+        self,
+        text: str,
+        running: bool,
+        active_action: str | None = None,
+    ) -> None:
         self.state_value.setText(text)
         self.state_value.setObjectName("stateBusy" if running else "stateIdle")
         self.state_value.style().unpolish(self.state_value)
@@ -422,10 +515,11 @@ class DeviceCard(QFrame):
         self.setProperty("cardState", "busy" if running else "idle")
         self.style().unpolish(self)
         self.style().polish(self)
-        self.erase_button.setEnabled(not running)
-        self.flash_button.setEnabled(not running)
-        self.reset_button.setEnabled(not running)
-        self.stop_button.setEnabled(running)
+        self._set_action_button_mode(
+            stop_mode=running,
+            enabled=True,
+            active_action=active_action,
+        )
         if running:
             self._process_output_buffer = ""
             self._last_stage_log = ""
@@ -447,10 +541,7 @@ class DeviceCard(QFrame):
         self.style().unpolish(self)
         self.style().polish(self)
         is_disconnected = state == "disconnected"
-        self.erase_button.setEnabled(not is_disconnected)
-        self.flash_button.setEnabled(not is_disconnected)
-        self.reset_button.setEnabled(not is_disconnected)
-        self.stop_button.setEnabled(False)
+        self._set_action_button_mode(stop_mode=False, enabled=not is_disconnected)
         if state == "success":
             self.progress_bar.setValue(100)
             self.progress_bar.setFormat("完成 100%")
