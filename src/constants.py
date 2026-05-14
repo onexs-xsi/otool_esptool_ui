@@ -140,6 +140,7 @@ FLASH_BAUD_DEFAULT = "921600"
 
 _CHIP_ARG_MAP = [
     ("esp32-p4", "esp32p4"),
+    ("esp32-s31", "esp32s31"),
     ("esp32-s3", "esp32s3"),
     ("esp32-s2", "esp32s2"),
     ("esp32-c6", "esp32c6"),

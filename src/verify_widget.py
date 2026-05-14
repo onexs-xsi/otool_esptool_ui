@@ -10,13 +10,14 @@ from pathlib import Path
 
 import serial
 from PyQt6.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QTextCursor
+from PyQt6.QtGui import QColor, QFont, QSyntaxHighlighter, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QMessageBox,
     QPlainTextEdit,
@@ -47,6 +48,58 @@ from .verify_plan import (
     render_template_text,
 )
 from .verify_visual_editor import VerifyVisualEditor
+
+
+class YamlSyntaxHighlighter(QSyntaxHighlighter):
+    """YAML 代码语法高亮。"""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+
+        def _fmt(color: str, bold: bool = False) -> QTextCharFormat:
+            fmt = QTextCharFormat()
+            fmt.setForeground(QColor(color))
+            if bold:
+                fmt.setFontWeight(700)
+            return fmt
+
+        # (pattern, group_index, format)  group_index=0 表示整个匹配
+        self._rules: list[tuple[re.Pattern, int, QTextCharFormat]] = [
+            # YAML key（高亮键名部分）
+            (re.compile(r"^\s*([\w_\-]+)\s*:"), 1, _fmt("#1d4ed8", bold=True)),
+            # 注释
+            (re.compile(r"#[^\n]*"), 0, _fmt("#8b9db7")),
+            # 双引号字符串
+            (re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*"'), 0, _fmt("#059669")),
+            # 单引号字符串
+            (re.compile(r"'[^']*'"), 0, _fmt("#059669")),
+            # 特殊值
+            (re.compile(r"\b(true|false|null|~)\b", re.IGNORECASE), 0, _fmt("#7c3aed", bold=True)),
+            # 数字
+            (re.compile(r"\b-?\d+(\.\d+)?\b"), 0, _fmt("#c2410c")),
+            # 列表符号
+            (re.compile(r"^\s*-\s"), 0, _fmt("#0369a1")),
+            # action 关键字
+            (
+                re.compile(
+                    r"\b(reset|wait|wait_silence|send_text|expect|capture"
+                    r"|set_result|clear_buffer|pass|fail)\b"
+                ),
+                0,
+                _fmt("#7c3aed"),
+            ),
+        ]
+
+    def highlightBlock(self, text: str) -> None:  # type: ignore[override]
+        for pattern, group_idx, fmt in self._rules:
+            for match in pattern.finditer(text):
+                if group_idx == 0:
+                    start = match.start()
+                    length = match.end() - match.start()
+                else:
+                    start = match.start(group_idx)
+                    length = match.end(group_idx) - match.start(group_idx)
+                self.setFormat(start, length, fmt)
 
 
 class _VerificationStopped(RuntimeError):
@@ -610,6 +663,8 @@ class VerifyWidget(QWidget):
         self._import_btn.clicked.connect(self._import_profiles)
         self._export_btn = QPushButton("导出 YAML")
         self._export_btn.clicked.connect(self._export_current_profile)
+        self._new_profile_btn = QPushButton("新建")
+        self._new_profile_btn.clicked.connect(self._new_profile)
         self._validate_btn = QPushButton("检查脚本")
         self._validate_btn.clicked.connect(self._validate_current_profile_with_feedback)
 
@@ -618,6 +673,7 @@ class VerifyWidget(QWidget):
         plan_header.addWidget(profile_label)
         plan_header.addWidget(self._profile_combo)
         plan_header.addWidget(self._load_profile_btn)
+        plan_header.addWidget(self._new_profile_btn)
         plan_header.addWidget(self._import_btn)
         plan_header.addWidget(self._export_btn)
         plan_header.addWidget(self._validate_btn)
@@ -651,10 +707,27 @@ class VerifyWidget(QWidget):
         _mono_font.setStyleHint(QFont.StyleHint.TypeWriter)
         _mono_font.setPointSize(10)
         self._plan_edit.setFont(_mono_font)
+        self._yaml_highlighter = YamlSyntaxHighlighter(self._plan_edit.document())
+
+        # YAML tab 包一层，顶部加格式化工具栏
+        yaml_tab = QWidget()
+        yaml_tab_layout = QVBoxLayout(yaml_tab)
+        yaml_tab_layout.setContentsMargins(0, 4, 0, 0)
+        yaml_tab_layout.setSpacing(4)
+        yaml_toolbar = QHBoxLayout()
+        yaml_toolbar.setContentsMargins(8, 0, 8, 0)
+        yaml_toolbar.setSpacing(6)
+        self._format_yaml_btn = QPushButton("格式化")
+        self._format_yaml_btn.setToolTip("整理 YAML 缩进与格式")
+        self._format_yaml_btn.clicked.connect(self._format_yaml)
+        yaml_toolbar.addStretch(1)
+        yaml_toolbar.addWidget(self._format_yaml_btn)
+        yaml_tab_layout.addLayout(yaml_toolbar)
+        yaml_tab_layout.addWidget(self._plan_edit, 1)
 
         self._editor_tabs = QTabWidget()
         self._editor_tabs.addTab(self._visual_editor, "可视化编排")
-        self._editor_tabs.addTab(self._plan_edit, "YAML")
+        self._editor_tabs.addTab(yaml_tab, "YAML")
         self._editor_tabs.setCurrentIndex(0)
         self._editor_tabs.currentChanged.connect(self._on_editor_tab_changed)
 
@@ -799,6 +872,13 @@ class VerifyWidget(QWidget):
         root.addWidget(self._main_splitter, 1)
 
     def _apply_style(self) -> None:
+        _assets = Path(__file__).parent / "assets"
+        _up_svg = (_assets / "spin_up.svg").as_posix()
+        _down_svg = (_assets / "spin_down.svg").as_posix()
+        _spinbox_arrow_css = (
+            "QSpinBox::up-arrow { image: url(" + _up_svg + "); width: 8px; height: 6px; }\n"
+            "QSpinBox::down-arrow { image: url(" + _down_svg + "); width: 8px; height: 6px; }\n"
+        )
         self.setStyleSheet(
             BASE_STYLESHEET
             + """
@@ -866,13 +946,45 @@ class VerifyWidget(QWidget):
                 color: #6b7a94;
                 padding: 6px 8px;
             }
-            QPlainTextEdit, QLineEdit, QSpinBox, QComboBox {
+            QPlainTextEdit, QLineEdit, QComboBox {
                 background: #ffffff;
                 border: 1px solid #d8e0ea;
                 border-radius: 8px;
                 color: #1e293b;
                 min-height: 24px;
             }
+            QSpinBox {
+                background: #ffffff;
+                border: 1px solid #d8e0ea;
+                border-radius: 4px;
+                color: #1e293b;
+                min-height: 24px;
+                padding: 2px 22px 2px 6px;
+            }
+            QSpinBox::up-button {
+                subcontrol-origin: border;
+                subcontrol-position: top right;
+                width: 20px;
+                border-left: 1px solid #d8e0ea;
+                border-top-right-radius: 4px;
+                background: #f0f3f9;
+            }
+            QSpinBox::up-button:hover { background: #dbeafe; }
+            QSpinBox::up-button:pressed { background: #bfdbfe; }
+            QSpinBox::down-button {
+                subcontrol-origin: border;
+                subcontrol-position: bottom right;
+                width: 20px;
+                border-left: 1px solid #d8e0ea;
+                border-top: 1px solid #d8e0ea;
+                border-bottom-right-radius: 4px;
+                background: #f0f3f9;
+            }
+            QSpinBox::down-button:hover { background: #dbeafe; }
+            QSpinBox::down-button:pressed { background: #bfdbfe; }
+            """
+            + _spinbox_arrow_css
+            + """
             QPlainTextEdit {
                 padding: 8px 10px;
                 font-size: 11px;
@@ -880,8 +992,8 @@ class VerifyWidget(QWidget):
             QPlainTextEdit#verifyPlanEdit {
                 background: #fbfcfe;
             }
-            QLineEdit, QSpinBox, QComboBox {
-                padding: 4px 8px;
+            QLineEdit, QComboBox {
+                padding: 2px 6px;
             }
             QLineEdit#stepInlineEdit {
                 min-height: 20px;
@@ -1122,6 +1234,37 @@ class VerifyWidget(QWidget):
             encoding="utf-8",
         )
         self._append_log(f"已导出检验配置：{save_path}")
+
+    def _new_profile(self) -> None:
+        name, ok = QInputDialog.getText(self, "新建检验配置", "请输入配置名称：", text="新配置")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        if name in self._profiles:
+            QMessageBox.warning(self, "提示", f'配置\u201c{name}\u201d已存在，请使用其他名称。')
+            return
+        profile = VerifyProfile(
+            name=name,
+            steps=[VerifyStep(action="reset", label="复位设备")],
+        )
+        self._profiles[name] = profile
+        self._refresh_profile_combo(select_name=name)
+        self._set_profile_to_editors(profile)
+        self._append_log(f"已新建检验配置：{name}")
+
+    def _format_yaml(self) -> None:
+        import yaml
+
+        text = self._plan_edit.toPlainText().strip()
+        if not text:
+            return
+        try:
+            data = yaml.safe_load(text)
+            formatted = yaml.safe_dump(data, allow_unicode=True, sort_keys=False, default_flow_style=False)
+            self._plan_edit.setPlainText(formatted)
+            self._append_log("YAML 已格式化")
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "格式化失败", f"YAML 解析错误：\n{exc}")
 
     def _validate_current_profile_with_feedback(self) -> None:
         profile = self._validate_current_profile(show_message=True)

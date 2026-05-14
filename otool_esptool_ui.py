@@ -8,7 +8,7 @@ For package usage::
     otool_esptool_ui.main()
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 __author__ = "ONEXS"
 __title__ = "OTool Esptool UI | byonexs."
 

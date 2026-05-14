@@ -77,6 +77,7 @@ def dispatch_internal_worker() -> None:
     emit_worker_event({"type": "log", "level": "info", "text": "[Worker] 工作进程已启动"})
 
     from esptool.logger import TemplateLogger, log as esptool_log
+    from esptool.util import FatalError as EsptoolFatalError
 
     class WorkerLogger(TemplateLogger):
         # NOTE: set_logger() uses __class__ reassignment, not instance copy.
@@ -164,6 +165,14 @@ def dispatch_internal_worker() -> None:
             exit_code = exc.code
         elif exc.code:
             exit_code = 1
+    except EsptoolFatalError as exc:
+        emit_worker_event(
+            {
+                "type": "fatal",
+                "text": str(exc).rstrip(),
+            }
+        )
+        exit_code = 1
     except BaseException as exc:
         emit_worker_event(
             {

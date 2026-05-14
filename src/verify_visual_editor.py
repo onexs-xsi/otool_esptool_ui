@@ -28,6 +28,23 @@ from .verify_plan import (
 )
 
 
+class _DownComboBox(QComboBox):
+    """始终向下弹出的 QComboBox，解决嵌套 ScrollArea 内弹出位置漂移问题。"""
+
+    def showPopup(self) -> None:
+        super().showPopup()
+        container = self.view().parentWidget()
+        if container is not None:
+            pos = self.mapToGlobal(self.rect().bottomLeft())
+            container.move(pos)
+
+
+_BAUDRATE_PRESETS = [
+    "9600", "19200", "38400", "57600", "115200",
+    "230400", "460800", "921600", "1500000", "2000000",
+]
+
+
 _ACTION_LABELS = {
     "reset": "复位",
     "wait": "等待",
@@ -346,7 +363,7 @@ class VerifyStepBlock(QFrame):
 
         action_label = QLabel("步骤类型")
         action_label.setObjectName("metaKey")
-        self._action_combo = QComboBox()
+        self._action_combo = _DownComboBox()
         for action, label in _ACTION_LABELS.items():
             self._action_combo.addItem(label, action)
 
@@ -451,7 +468,7 @@ class VerifyStepBlock(QFrame):
 
         method_label = QLabel("复位方式")
         method_label.setObjectName("metaKey")
-        self._reset_method_combo = QComboBox()
+        self._reset_method_combo = _DownComboBox()
         for text, value in _RESET_METHOD_OPTIONS:
             self._reset_method_combo.addItem(text, value)
 
@@ -569,13 +586,13 @@ class VerifyStepBlock(QFrame):
 
         match_mode_label = QLabel("判定模式")
         match_mode_label.setObjectName("metaKey")
-        self._match_mode_combo = QComboBox()
+        self._match_mode_combo = _DownComboBox()
         for text, value in _MATCH_MODE_OPTIONS:
             self._match_mode_combo.addItem(text, value)
 
         match_type_label = QLabel("匹配方式")
         match_type_label.setObjectName("metaKey")
-        self._match_type_combo = QComboBox()
+        self._match_type_combo = _DownComboBox()
         for text, value in _MATCH_TYPE_OPTIONS:
             self._match_type_combo.addItem(text, value)
 
@@ -613,13 +630,13 @@ class VerifyStepBlock(QFrame):
 
         match_mode_label = QLabel("读取条件")
         match_mode_label.setObjectName("metaKey")
-        self._capture_match_mode_combo = QComboBox()
+        self._capture_match_mode_combo = _DownComboBox()
         for text, value in _MATCH_MODE_OPTIONS[:2]:
             self._capture_match_mode_combo.addItem(text, value)
 
         match_type_label = QLabel("读取方式")
         match_type_label.setObjectName("metaKey")
-        self._capture_match_type_combo = QComboBox()
+        self._capture_match_type_combo = _DownComboBox()
         for text, value in _MATCH_TYPE_OPTIONS:
             self._capture_match_type_combo.addItem(text, value)
 
@@ -903,22 +920,25 @@ class VerifyVisualEditor(QWidget):
         serial_grid.setHorizontalSpacing(10)
         serial_grid.setVerticalSpacing(8)
 
-        self._baudrate_spin = QSpinBox()
-        self._baudrate_spin.setRange(1, 4000000)
-        self._baudrate_spin.setValue(115200)
+        self._baudrate_combo = _DownComboBox()
+        self._baudrate_combo.setEditable(True)
+        self._baudrate_combo.setMinimumWidth(90)
+        for baud in _BAUDRATE_PRESETS:
+            self._baudrate_combo.addItem(baud)
+        self._baudrate_combo.setCurrentText("115200")
         self._timeout_spin = QSpinBox()
         self._timeout_spin.setRange(1, 60000)
         self._timeout_spin.setValue(80)
         self._max_buffer_spin = QSpinBox()
         self._max_buffer_spin.setRange(256, 500000)
         self._max_buffer_spin.setValue(20000)
-        self._bytesize_combo = QComboBox()
+        self._bytesize_combo = _DownComboBox()
         for item in _BYTESIZE_OPTIONS:
             self._bytesize_combo.addItem(item)
-        self._parity_combo = QComboBox()
+        self._parity_combo = _DownComboBox()
         for item in _PARITY_OPTIONS:
             self._parity_combo.addItem(item)
-        self._stopbits_combo = QComboBox()
+        self._stopbits_combo = _DownComboBox()
         for item in _STOP_BITS_OPTIONS:
             self._stopbits_combo.addItem(item)
         self._encoding_edit = QLineEdit("utf-8")
@@ -928,7 +948,7 @@ class VerifyVisualEditor(QWidget):
         self._newline_edit.setPlaceholderText(r"例如：\r\n / \n")
 
         serial_grid.addWidget(self._make_key_label("波特率"), 0, 0)
-        serial_grid.addWidget(self._baudrate_spin, 0, 1)
+        serial_grid.addWidget(self._baudrate_combo, 0, 1)
         serial_grid.addWidget(self._make_key_label("字节位"), 0, 2)
         serial_grid.addWidget(self._bytesize_combo, 0, 3)
         serial_grid.addWidget(self._make_key_label("校验位"), 0, 4)
@@ -1015,7 +1035,7 @@ class VerifyVisualEditor(QWidget):
 
     def load_profile(self, profile: VerifyProfile) -> None:
         self._description_edit.setPlainText(profile.description)
-        self._baudrate_spin.setValue(profile.serial.baudrate)
+        self._baudrate_combo.setCurrentText(str(profile.serial.baudrate))
         self._bytesize_combo.setCurrentText(str(profile.serial.bytesize))
         self._parity_combo.setCurrentText(profile.serial.parity)
         self._stopbits_combo.setCurrentText(str(profile.serial.stopbits).rstrip("0").rstrip("."))
@@ -1050,7 +1070,7 @@ class VerifyVisualEditor(QWidget):
             name=name,
             description=self._description_edit.toPlainText().strip(),
             serial=VerifySerialConfig(
-                baudrate=self._baudrate_spin.value(),
+                baudrate=int(self._baudrate_combo.currentText().strip() or "115200"),
                 bytesize=int(self._bytesize_combo.currentText()),
                 parity=self._parity_combo.currentText(),
                 stopbits=float(self._stopbits_combo.currentText()),
