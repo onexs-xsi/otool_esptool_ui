@@ -74,6 +74,7 @@ from .constants import (
 from .dialog_memory import get_existing_directory, get_open_file_name
 from .device_card import DeviceCard
 from .efuse_batch_dialog import BurnEfuseBatchWidget
+from .jump_list import setup_jump_list
 from .efuse_dialog import EFuseDialog
 from .export_dialog import ExportFlashDialog
 from .flow_layout import FlowLayout
@@ -540,10 +541,37 @@ class OtoolEsptoolUI(QMainWindow):
         )
         pg3_layout.addWidget(self._merge_split_widget)
 
+        # 页 4 — 终端台（占位界面，功能待开发）
+        page_terminal = QWidget()
+        pg4_layout = QVBoxLayout(page_terminal)
+        pg4_layout.setContentsMargins(0, 0, 0, 70)
+        _term_frame = QFrame()
+        _term_frame.setObjectName("mergeSplitFrame")
+        _term_fl = QVBoxLayout(_term_frame)
+        _term_fl.setContentsMargins(40, 60, 40, 60)
+        _term_icon = QLabel(">_")
+        _term_icon.setObjectName("terminalPlaceholderIcon")
+        _term_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _term_title = QLabel("串口终端台")
+        _term_title.setObjectName("terminalPlaceholderTitle")
+        _term_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _term_hint = QLabel("串口终端监视与交互功能，即将推出")
+        _term_hint.setObjectName("emptyHint")
+        _term_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        _term_fl.addStretch(1)
+        _term_fl.addWidget(_term_icon)
+        _term_fl.addSpacing(12)
+        _term_fl.addWidget(_term_title)
+        _term_fl.addSpacing(6)
+        _term_fl.addWidget(_term_hint)
+        _term_fl.addStretch(1)
+        pg4_layout.addWidget(_term_frame)
+
         self.page_stack.addWidget(page_flash)
         self.page_stack.addWidget(page_efuse)
         self.page_stack.addWidget(page_verify)
         self.page_stack.addWidget(page_merge_split)
+        self.page_stack.addWidget(page_terminal)
 
         root_layout.addWidget(toolbar)
         root_layout.addWidget(self.page_stack, 1)
@@ -604,7 +632,7 @@ class OtoolEsptoolUI(QMainWindow):
         layout = QHBoxLayout(panel)
         layout.setContentsMargins(6, 4, 6, 4)
         layout.setSpacing(0)
-        self.tab_switcher = TabSwitcher(["烧录台", "熔丝台", "校验台", "分合台"], panel)
+        self.tab_switcher = TabSwitcher(["烧录台", "熔丝台", "校验台", "分合台", "终端台"], panel)
         self.tab_switcher.currentChanged.connect(self.page_stack.setCurrentIndex)
         self.tab_switcher.currentChanged.connect(self._on_tab_changed)
         layout.addWidget(self.tab_switcher)
@@ -637,7 +665,7 @@ class OtoolEsptoolUI(QMainWindow):
     def _position_floating_info_panel(self) -> None:
         self._position_floating_panels()
 
-    _TAB_TITLES = ["烧录台", "熔丝台", "校验台", "分合台"]
+    _TAB_TITLES = ["烧录台", "熔丝台", "校验台", "分合台", "终端台"]
 
     def _on_tab_changed(self, idx: int) -> None:
         self.hero_title.setText(self._TAB_TITLES[idx])
@@ -1117,6 +1145,17 @@ class OtoolEsptoolUI(QMainWindow):
                 min-height: 24px;
                 padding: 2px 8px;
                 border-radius: 3px;
+            }
+            QLabel#terminalPlaceholderIcon {
+                font-size: 52px;
+                font-weight: 700;
+                color: #c5cad4;
+                letter-spacing: 4px;
+            }
+            QLabel#terminalPlaceholderTitle {
+                font-size: 20px;
+                font-weight: 700;
+                color: #9aa5bc;
             }
             """.replace("__ARROW_PATH__", _arrow_path)
         )
@@ -2193,7 +2232,25 @@ def main() -> int:
     window = OtoolEsptoolUI()
     if _qicon:
         window.setWindowIcon(_qicon)
+
+    # 处理 --tab N 参数（从 Jump List 任务启动时，在 show() 前设置，避免页面闪烁）
+    if "--tab" in sys.argv:
+        try:
+            _tab_idx = int(sys.argv[sys.argv.index("--tab") + 1])
+            window.tab_switcher.set_current(_tab_idx, animated=False)
+        except (ValueError, IndexError):
+            pass
+
     window.show()
+
+    # Windows Jump List：向任务栏注册快捷任务（任务对应 --tab 参数切换页面）
+    setup_jump_list(
+        app_id="onexs.otool_esptool_ui",
+        exe_path=sys.executable,
+        tasks=[("烧录", ""), ("合成", "--tab 3"), ("终端", "--tab 4")],
+        script_path=TOOL_DIR / "otool_esptool_ui.py",
+        icon_path=None if _FROZEN else _ico_path,
+    )
 
     # Windows 11: Qt 的 setWindowIcon 在某些情况下不发送 WM_SETICON。
     # 用 LoadImageW + SendMessageW 直接写入窗口句柄，确保任务栏/开始菜单显示正确图标。
