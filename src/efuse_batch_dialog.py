@@ -39,6 +39,7 @@ from .constants import (
     FLASH_BAUD_OPTIONS,
     TOOL_DIR,
     _build_tool_command,
+    decode_process_output,
     _inject_local_esptool_pythonpath,
     _tool_backend_available,
     resolve_chip_arg,
@@ -1010,7 +1011,7 @@ class BurnEfuseBatchWidget(QWidget):
 
         buf: list[str] = []
         process.readyReadStandardOutput.connect(lambda: buf.append(
-            bytes(process.readAllStandardOutput()).decode("utf-8", errors="replace")
+            decode_process_output(bytes(process.readAllStandardOutput()))
         ))
         process.finished.connect(
             lambda code, _status: self._on_process_finished(task, code, "".join(buf), on_finished)

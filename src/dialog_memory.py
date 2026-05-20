@@ -36,7 +36,12 @@ def remember_dialog_path(path: str | Path) -> None:
 
 def remembered_start_path(default_name: str = "") -> str:
     base = current_dialog_dir()
-    return str(base / default_name) if default_name else str(base)
+    if not default_name:
+        return str(base)
+    candidate = Path(default_name)
+    if candidate.is_absolute() or len(candidate.parts) > 1:
+        return str(candidate)
+    return str(base / default_name)
 
 
 def get_open_file_name(

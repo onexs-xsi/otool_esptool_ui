@@ -25,6 +25,7 @@ from .constants import (
     TOOL_DIR,
     EFUSE_CHIP_PRESETS,
     _build_tool_command,
+    decode_process_output,
     _inject_local_esptool_pythonpath,
     resolve_chip_arg,
 )
@@ -421,7 +422,7 @@ class EFuseDialog(QDialog):
     def _on_output(self, log: QPlainTextEdit | None) -> None:
         if self.process is None:
             return
-        data = bytes(self.process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        data = decode_process_output(bytes(self.process.readAllStandardOutput()))
         if self._is_reading:
             self._read_buf.append(data)
         if log is not None:

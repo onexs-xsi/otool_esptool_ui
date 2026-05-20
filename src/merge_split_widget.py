@@ -41,6 +41,7 @@ from PyQt6.QtWidgets import (
 from .constants import (
     TOOL_DIR,
     _build_tool_command,
+    decode_process_output,
     _inject_local_esptool_pythonpath,
     _tool_backend_available,
 )
@@ -839,7 +840,7 @@ class MergeSplitWidget(QWidget):
         env.insert("PYTHONUTF8", "1")
         proc.setProcessEnvironment(env)
         proc.readyRead.connect(lambda: self._append_log(
-            bytes(proc.readAll()).decode("utf-8", errors="replace").rstrip()
+            decode_process_output(bytes(proc.readAll())).rstrip()
         ))
 
         def _on_finished(exit_code, _):
@@ -1156,8 +1157,11 @@ class MergeSplitWidget(QWidget):
     def _merge_browse_output(self) -> None:
         fmt = self._merge_fmt_combo.currentText()
         ext_map = {"raw": "Binary Files (*.bin)", "uf2": "UF2 Files (*.uf2)", "hex": "Hex Files (*.hex)"}
+        current = self._merge_output_edit.text().strip()
+        ext_name = {"raw": ".bin", "uf2": ".uf2", "hex": ".hex"}.get(fmt, ".bin")
+        default_name = current or f"merged{ext_name}"
         fp, _ = get_save_file_name(
-            self, "保存合成文件", "",
+            self, "保存合成文件", default_name,
             f"{ext_map.get(fmt, 'All Files (*.*)')};;All Files (*.*)",
         )
         if fp:
@@ -1255,7 +1259,7 @@ class MergeSplitWidget(QWidget):
             return
         raw = self._merge_process.readAll()
         if raw:
-            text = bytes(raw).decode("utf-8", errors="replace")
+            text = decode_process_output(bytes(raw))
             for line in text.splitlines():
                 self._append_log(line)
 

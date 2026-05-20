@@ -65,6 +65,7 @@ from .constants import (
     _build_reference_notice,
     _build_tool_command,
     _build_tool_worker_command,
+    decode_process_output,
     _inject_local_esptool_pythonpath,
     _local_esptool_available,
     _resolve_build_timestamp_text,
@@ -82,6 +83,7 @@ from .helpers import _build_avatar_icon, _build_github_icon, _fetch_remote_avata
 from .merge_split_widget import MergeSplitWidget
 from .models import DeviceInfo
 from .styles import BASE_STYLESHEET
+from .terminal_widget import TerminalWidget
 from .verify_widget import VerifyWidget
 
 
@@ -541,31 +543,12 @@ class OtoolEsptoolUI(QMainWindow):
         )
         pg3_layout.addWidget(self._merge_split_widget)
 
-        # 页 4 — 终端台（占位界面，功能待开发）
+        # 页 4 — 终端台
         page_terminal = QWidget()
         pg4_layout = QVBoxLayout(page_terminal)
         pg4_layout.setContentsMargins(0, 0, 0, 70)
-        _term_frame = QFrame()
-        _term_frame.setObjectName("mergeSplitFrame")
-        _term_fl = QVBoxLayout(_term_frame)
-        _term_fl.setContentsMargins(40, 60, 40, 60)
-        _term_icon = QLabel(">_")
-        _term_icon.setObjectName("terminalPlaceholderIcon")
-        _term_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        _term_title = QLabel("串口终端台")
-        _term_title.setObjectName("terminalPlaceholderTitle")
-        _term_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        _term_hint = QLabel("串口终端监视与交互功能，即将推出")
-        _term_hint.setObjectName("emptyHint")
-        _term_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        _term_fl.addStretch(1)
-        _term_fl.addWidget(_term_icon)
-        _term_fl.addSpacing(12)
-        _term_fl.addWidget(_term_title)
-        _term_fl.addSpacing(6)
-        _term_fl.addWidget(_term_hint)
-        _term_fl.addStretch(1)
-        pg4_layout.addWidget(_term_frame)
+        self._terminal_widget = TerminalWidget()
+        pg4_layout.addWidget(self._terminal_widget)
 
         self.page_stack.addWidget(page_flash)
         self.page_stack.addWidget(page_efuse)
@@ -1816,7 +1799,7 @@ class OtoolEsptoolUI(QMainWindow):
         card = self.device_cards.get(device_id)
         if card is None or card.process is None:
             return
-        data = bytes(card.process.readAll()).decode("utf-8", errors="replace")
+        data = decode_process_output(bytes(card.process.readAll()))
         if data:
             self._handle_process_output_chunk(card, data)
 
@@ -2192,6 +2175,7 @@ class OtoolEsptoolUI(QMainWindow):
         self.stop_all_devices()
         self._efuse_batch_widget._stop_all()
         self._verify_widget.stop_all_tasks()
+        self._terminal_widget.shutdown()
         super().closeEvent(event)
 
     def keyPressEvent(self, event) -> None:

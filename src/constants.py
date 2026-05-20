@@ -1,4 +1,5 @@
 import os
+import locale
 import re
 import sys
 import importlib.util
@@ -202,6 +203,30 @@ def _build_process_env_dict() -> dict[str, str]:
             os.pathsep + existing if existing else ""
         )
     return env
+
+
+def decode_process_output(data: bytes | bytearray | memoryview | None) -> str:
+    """Decode subprocess / QProcess output without losing Chinese paths."""
+    if not data:
+        return ""
+    raw = bytes(data)
+    encodings = ["utf-8"]
+    preferred = locale.getpreferredencoding(False)
+    if preferred:
+        encodings.append(preferred)
+    encodings.extend(["gb18030", "cp936"])
+
+    seen: set[str] = set()
+    for enc in encodings:
+        key = enc.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode(encodings[0], errors="replace")
 
 
 # ── 杂项 ─────────────────────────────────────────────────────────────────────
