@@ -3,6 +3,7 @@ from __future__ import annotations
 import queue
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from html import escape
@@ -123,11 +124,15 @@ class TerminalSerialThread(QThread):
         super().__init__(parent)
         self._config = config
         self._stop_event = threading.Event()
+        self._reset_requested = threading.Event()
         self._send_queue: queue.Queue[bytes] = queue.Queue()
         self._serial: serial.Serial | None = None
 
     def request_stop(self) -> None:
         self._stop_event.set()
+
+    def request_reset(self) -> None:
+        self._reset_requested.set()
 
     def send(self, data: bytes) -> None:
         if data:
@@ -168,11 +173,26 @@ class TerminalSerialThread(QThread):
     def _read_write_loop(self) -> None:
         assert self._serial is not None
         while not self._stop_event.is_set():
+            if self._reset_requested.is_set():
+                self._perform_reset()
+                self._reset_requested.clear()
             self._drain_send_queue()
             waiting = self._serial.in_waiting
             raw = self._serial.read(waiting or 1)
             if raw:
                 self.data_received.emit(bytes(raw))
+
+    def _perform_reset(self) -> None:
+        if self._serial and self._serial.is_open:
+            try:
+                # 硬件复位序列：拉低 DTR (pyserial setDTR(False) 为高电平)，拉高 RTS (setRTS(True) 为低电平使 EN 拉低复位)
+                # 保持 100ms 后释放 RTS (setRTS(False) 使 EN 拉高启动)
+                self._serial.setDTR(False)
+                self._serial.setRTS(True)
+                time.sleep(0.1)
+                self._serial.setRTS(False)
+            except serial.SerialException as exc:
+                self.error.emit(f"串口复位错误：{exc}")
 
     def _drain_send_queue(self) -> None:
         assert self._serial is not None
@@ -343,6 +363,11 @@ class TerminalWidget(QWidget):
         self._disconnect_btn.setObjectName("dangerButton")
         self._disconnect_btn.setEnabled(False)
         self._disconnect_btn.clicked.connect(self.close_serial)
+        self._reset_btn = QPushButton("复位重启")
+        self._reset_btn.setObjectName("warningButton")
+        self._reset_btn.setToolTip("拉低 EN (RTS/DTR) 引脚以硬件复位重启设备")
+        self._reset_btn.setEnabled(False)
+        self._reset_btn.clicked.connect(self._trigger_reset)
 
         self._add_labeled_control(grid, 0, 0, "模式", self._mode_combo)
         self._add_labeled_control(grid, 0, 2, "串口", self._port_combo)
@@ -355,7 +380,8 @@ class TerminalWidget(QWidget):
         grid.addWidget(self._connect_btn, 1, 6)
         grid.addWidget(self._listen_btn, 1, 7)
         grid.addWidget(self._disconnect_btn, 1, 8)
-        grid.setColumnStretch(9, 1)
+        grid.addWidget(self._reset_btn, 1, 9)
+        grid.setColumnStretch(10, 1)
 
         control_layout.addLayout(header)
         control_layout.addLayout(grid)
@@ -614,6 +640,22 @@ class TerminalWidget(QWidget):
                 border-color: #1a4db5;
                 color: #ffffff;
             }
+            QPushButton#warningButton {
+                background: #fffbeb;
+                border: 1px solid #d97706;
+                color: #b45309;
+            }
+            QPushButton#warningButton:hover {
+                background: #fef3c7;
+            }
+            QPushButton#warningButton:pressed {
+                background: #fde68a;
+            }
+            QPushButton#warningButton:disabled {
+                background: #f5f6f8;
+                color: #b0b8cd;
+                border-color: #e8eaef;
+            }
             """
         )
 
@@ -759,6 +801,12 @@ class TerminalWidget(QWidget):
         session.serial_thread.request_stop()
         self._disconnect_btn.setEnabled(False)
 
+    def _trigger_reset(self) -> None:
+        session = self._active_session()
+        if session is not None and session.serial_thread is not None:
+            self._append_sys("正在拉低 RTS/DTR 触发设备复位重启...", session_id=session.session_id)
+            session.serial_thread.request_reset()
+
     def _on_listen_toggled(self, checked: bool) -> None:
         session = self._active_session()
         if session is None:
@@ -872,6 +920,7 @@ class TerminalWidget(QWidget):
             widget.setEnabled(not connected)
         self._connect_btn.setEnabled(not connected)
         self._disconnect_btn.setEnabled(connected)
+        self._reset_btn.setEnabled(connected)
 
     def _active_session(self) -> TerminalSession | None:
         return self._sessions.get(self._active_session_id or -1)

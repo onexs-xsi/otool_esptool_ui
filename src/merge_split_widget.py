@@ -14,8 +14,10 @@ import subprocess
 from pathlib import Path
 
 from PyQt6.QtCore import QProcess, QProcessEnvironment, Qt, pyqtSignal
-from PyQt6.QtGui import QFont, QTextCursor
+from PyQt6.QtGui import QFont, QTextCursor, QCursor
 from PyQt6.QtWidgets import (
+    QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QFrame,
@@ -451,6 +453,67 @@ class _EntryRow(QWidget):
             self.addr_edit.setText(m.group(1).lower())
 
 
+class CopyableHashWidget(QWidget):
+    """显示哈希值，支持手动选择复制和双击复制。"""
+
+    def __init__(self, label_text: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+
+        lbl = QLabel(label_text)
+        lbl.setObjectName("configLabel")
+        lbl.setFixedWidth(64)
+
+        self.edit = QLineEdit()
+        self.edit.setReadOnly(True)
+        self.edit.setToolTip("双击可以直接复制哈希值")
+        self.edit.setStyleSheet("""
+            QLineEdit {
+                background: #f8f9fb;
+                border: 1px solid #dde1ea;
+                border-radius: 6px;
+                padding: 4px 10px;
+                color: #1a2333;
+                font-family: 'Consolas', 'Menlo', 'monospace';
+                font-size: 12px;
+            }
+            QLineEdit:hover {
+                border-color: #2560e0;
+                background: #ffffff;
+            }
+        """)
+
+        # 双击事件连接
+        self.edit.mouseDoubleClickEvent = self._on_double_click
+
+        copy_btn = QPushButton("复制")
+        copy_btn.setFixedWidth(52)
+        copy_btn.setStyleSheet("""
+            QPushButton {
+                padding: 4px 8px;
+                font-size: 11px;
+            }
+        """)
+        copy_btn.clicked.connect(self._copy_to_clipboard)
+
+        lay.addWidget(lbl)
+        lay.addWidget(self.edit, 1)
+        lay.addWidget(copy_btn)
+
+    def _on_double_click(self, event) -> None:
+        self._copy_to_clipboard()
+        self.edit.selectAll()
+
+    def _copy_to_clipboard(self) -> None:
+        val = self.edit.text().strip()
+        if val:
+            from PyQt6.QtWidgets import QToolTip
+            QApplication.clipboard().setText(val)
+            QToolTip.showText(QCursor.pos(), "✓ 已复制到剪贴板", self, self.rect(), 1200)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  MergeSplitWidget — 分合台主 Widget
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -539,9 +602,27 @@ class MergeSplitWidget(QWidget):
         self._split_extract_btn = QPushButton("全部提取")
         self._split_extract_btn.clicked.connect(self._split_extract_all)
         self._split_extract_btn.setEnabled(False)
+
+        # 哈希选择复选框
+        self._hash_label = QLabel("哈希值:")
+        self._hash_label.setObjectName("configLabel")
+        self._hash_md5_cb = QCheckBox("MD5")
+        self._hash_md5_cb.setChecked(True)
+        self._hash_sha1_cb = QCheckBox("SHA-1")
+        self._hash_sha256_cb = QCheckBox("SHA-256")
+
+        self._hash_md5_cb.toggled.connect(self._update_hash_display)
+        self._hash_sha1_cb.toggled.connect(self._update_hash_display)
+        self._hash_sha256_cb.toggled.connect(self._update_hash_display)
+
         r3.addWidget(self._split_analyze_btn)
         r3.addWidget(self._split_from_device_btn)
         r3.addWidget(self._split_extract_btn)
+        r3.addSpacing(12)
+        r3.addWidget(self._hash_label)
+        r3.addWidget(self._hash_md5_cb)
+        r3.addWidget(self._hash_sha1_cb)
+        r3.addWidget(self._hash_sha256_cb)
         r3.addStretch(1)
         sl.addLayout(r3)
 
@@ -566,6 +647,12 @@ class MergeSplitWidget(QWidget):
         self._split_table.setMinimumHeight(100)
         self._split_table.cellDoubleClicked.connect(self._split_double_click)
         sl.addWidget(self._split_table, 1)
+
+        # 列表下方的哈希值展示区
+        self._hash_display_layout = QVBoxLayout()
+        self._hash_display_layout.setContentsMargins(0, 4, 0, 4)
+        self._hash_display_layout.setSpacing(4)
+        sl.addLayout(self._hash_display_layout)
 
         # ── 下：合成区 ───────────────────────────────────────────
         merge_frame = QFrame()
@@ -939,6 +1026,39 @@ class MergeSplitWidget(QWidget):
         if not rows and not result["warnings"]:
             self._append_log("未找到有效分区。")
         self._append_log(f"分析完成，共 {len(rows)} 个区域。")
+        self._update_hash_display()
+
+    def _update_hash_display(self) -> None:
+        # 清空现有的哈希显示小部件
+        while self._hash_display_layout.count():
+            item = self._hash_display_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+
+        if not hasattr(self, "_split_data") or not self._split_data:
+            return
+
+        import hashlib
+
+        # 检查每个复选框是否选中并动态生成行
+        if self._hash_md5_cb.isChecked():
+            h_val = hashlib.md5(self._split_data).hexdigest()
+            row = CopyableHashWidget("MD5:", self)
+            row.edit.setText(h_val)
+            self._hash_display_layout.addWidget(row)
+
+        if self._hash_sha1_cb.isChecked():
+            h_val = hashlib.sha1(self._split_data).hexdigest()
+            row = CopyableHashWidget("SHA-1:", self)
+            row.edit.setText(h_val)
+            self._hash_display_layout.addWidget(row)
+
+        if self._hash_sha256_cb.isChecked():
+            h_val = hashlib.sha256(self._split_data).hexdigest()
+            row = CopyableHashWidget("SHA-256:", self)
+            row.edit.setText(h_val)
+            self._hash_display_layout.addWidget(row)
 
     def _split_double_click(self, row: int, _col: int) -> None:
         if row >= len(self._split_rows_data):
