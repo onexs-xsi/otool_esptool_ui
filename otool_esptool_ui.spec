@@ -43,6 +43,10 @@ _PACKAGES = [
     "esptool",
     "espefuse",
     "espsecure",
+    # espsecure/espefuse import cryptography through code paths that are not
+    # always visible to PyInstaller's static analysis.  Collect it explicitly
+    # so the native Rust extension is present in every frozen build.
+    "cryptography",
     "serial",
     "bitstring",
 ]
@@ -86,6 +90,7 @@ except Exception:
 
 # 额外确保这些常遗漏的模块
 hidden_imports += [
+    "cryptography.hazmat.bindings._rust",
     "rich_click",
     "bitstring.bitstore_bitarray",
     "bitstring.bitstore_bitarray_helpers",
@@ -162,6 +167,18 @@ a = Analysis(
     excludes=[],
     noarchive=False,
 )
+
+# Fail the build here instead of shipping an executable that crashes only
+# when the frozen espefuse/espsecure dispatcher is used.
+_CRYPTOGRAPHY_RUST_BINARY = "cryptography/hazmat/bindings/_rust.pyd"
+if not any(
+    str(entry[0]).replace("\\", "/").lower().endswith(_CRYPTOGRAPHY_RUST_BINARY)
+    for entry in a.binaries
+):
+    raise RuntimeError(
+        "PyInstaller did not collect cryptography.hazmat.bindings._rust; "
+        "update PyInstaller/hooks or reinstall cryptography before packaging."
+    )
 
 pyz = PYZ(a.pure)
 

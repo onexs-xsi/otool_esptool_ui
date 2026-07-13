@@ -297,6 +297,21 @@ function Start-AppProcess {
     Write-Step "Application started (PID $($proc.Id))"
 }
 
+function Test-PackagedToolDispatch {
+    param([Parameter(Mandatory = $true)] [string]$ExecutablePath)
+
+    foreach ($toolName in @('espefuse.py', 'espsecure.py')) {
+        Write-Step "Smoke-testing frozen dispatcher: $toolName --help"
+        $process = Start-Process -FilePath $ExecutablePath `
+            -ArgumentList @($toolName, '--help') `
+            -WorkingDirectory $Script:ProjectRoot `
+            -WindowStyle Hidden -PassThru -Wait
+        if ($process.ExitCode -ne 0) {
+            throw "Frozen dispatcher smoke test failed: $toolName (exit $($process.ExitCode))"
+        }
+    }
+}
+
 function Build-Package {
     param(
         [Parameter(Mandatory = $true)] [string]$Version,
@@ -324,6 +339,7 @@ function Build-Package {
     Invoke-CheckedExternal -FilePath $Script:VenvPython -Arguments $pyiArgs -Description 'Running PyInstaller'
 
     if (-not (Test-Path $Script:PackageOutput)) { throw "Package not found: $Script:PackageOutput" }
+    Test-PackagedToolDispatch -ExecutablePath $Script:PackageOutput
     Write-Step "Package ready: $Script:PackageOutput"
 }
 
