@@ -31,7 +31,7 @@ else:
 # ── 应用信息（单一来源：otool_esptool_ui.py）─────────────────────────────────
 
 _DEFAULT_TITLE = "OTool Esptool UI | byonexs."
-_DEFAULT_VERSION = "0.6.0"
+_DEFAULT_VERSION = "0.6.1"
 _DEFAULT_AUTHOR = "ONEXS"
 
 
@@ -230,29 +230,6 @@ def decode_process_output(data: bytes | bytearray | memoryview | None) -> str:
 
 
 # ── 杂项 ─────────────────────────────────────────────────────────────────────
-
-def _build_reference_notice() -> str:
-    return "\n".join(
-        [
-            f"{APP_TITLE} v{APP_VERSION}",
-            f"Coder: {APP_AUTHOR}",
-            f"GitHub: {APP_GITHUB_URL}",
-            "",
-            "引用说明",
-            "- esptool: 用于芯片识别、擦除、烧录与 eFuse 操作。",
-            "  来源: https://github.com/espressif/esptool",
-            "- PyQt6: 用于桌面图形界面。",
-            "  来源: https://www.riverbankcomputing.com/software/pyqt/",
-            "- pyserial: 用于串口枚举与串口访问。",
-            "  来源: https://github.com/pyserial/pyserial",
-            "- PyInstaller: 用于构建 Windows 可执行文件。",
-            "  来源: https://pyinstaller.org/",
-            "",
-            "分发本工具时，请一并保留各上游项目的许可证与引用说明。",
-            "详细清单见仓库根目录的 THIRD_PARTY_NOTICES.md。",
-        ]
-    )
-
 
 def _resolve_build_timestamp_text() -> str:
     if _FROZEN:

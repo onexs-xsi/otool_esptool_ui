@@ -31,6 +31,8 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -42,6 +44,7 @@ from PyQt6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QStackedWidget,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
@@ -62,7 +65,6 @@ from .constants import (
     TOOL_DIR,
     _FROZEN,
     _build_process_env_dict,
-    _build_reference_notice,
     _build_tool_command,
     _build_tool_worker_command,
     decode_process_output,
@@ -82,9 +84,68 @@ from .flow_layout import FlowLayout
 from .helpers import _build_avatar_icon, _build_github_icon, _fetch_remote_avatar_bytes
 from .merge_split_widget import MergeSplitWidget
 from .models import DeviceInfo
+from .reference_components import (
+    build_reference_notice_html,
+    build_reference_notice_text,
+)
 from .styles import BASE_STYLESHEET
 from .terminal_widget import TerminalWidget
 from .verify_widget import VerifyWidget
+
+
+class ReferenceNoticeDialog(QDialog):
+    """Scrollable component/version notice with copyable offline details."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"引用说明 - {APP_TITLE}")
+        self.setModal(True)
+        self.setMinimumSize(900, 560)
+        self.resize(1120, 720)
+
+        build_time = _resolve_build_timestamp_text()
+        self._plain_text = build_reference_notice_text(
+            APP_TITLE,
+            APP_VERSION,
+            APP_AUTHOR,
+            APP_GITHUB_URL,
+            build_time,
+        )
+
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(14, 14, 14, 12)
+        root_layout.setSpacing(10)
+
+        browser = QTextBrowser(self)
+        browser.setObjectName("referenceNoticeBrowser")
+        browser.setOpenExternalLinks(True)
+        browser.setHtml(
+            build_reference_notice_html(
+                APP_TITLE,
+                APP_VERSION,
+                APP_AUTHOR,
+                APP_GITHUB_URL,
+                build_time,
+            )
+        )
+        browser.setStyleSheet(
+            "QTextBrowser#referenceNoticeBrowser {"
+            "  background: #ffffff; border: 1px solid #d8e0eb;"
+            "  border-radius: 8px; padding: 6px;"
+            "}"
+        )
+        root_layout.addWidget(browser, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, self)
+        copy_button = buttons.addButton(
+            "复制全部", QDialogButtonBox.ButtonRole.ActionRole
+        )
+        copy_button.clicked.connect(self._copy_all)
+        buttons.rejected.connect(self.reject)
+        root_layout.addWidget(buttons)
+
+    def _copy_all(self) -> None:
+        QApplication.clipboard().setText(self._plain_text)
 
 
 class TabSwitcher(QWidget):
@@ -1157,11 +1218,7 @@ class OtoolEsptoolUI(QMainWindow):
             self.github_button.setIcon(icon)
 
     def show_reference_notice(self) -> None:
-        QMessageBox.information(
-            self,
-            f"引用说明 - {APP_TITLE}",
-            _build_reference_notice(),
-        )
+        ReferenceNoticeDialog(self).exec()
 
     def auto_pick_firmware(self) -> None:
         if not self._flash_rows or self._flash_rows[0].path_edit.text().strip():

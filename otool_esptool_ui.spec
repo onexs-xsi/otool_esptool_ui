@@ -2,7 +2,12 @@
 import re
 import sys
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_submodules, collect_data_files, collect_all
+from PyInstaller.utils.hooks import (
+    collect_submodules,
+    collect_data_files,
+    collect_all,
+    copy_metadata,
+)
 
 TOOL_DIR = Path(SPECPATH)
 
@@ -51,6 +56,23 @@ _PACKAGES = [
     "bitstring",
 ]
 
+# “引用说明”在冻结版中也需要读取实际构建版本。显式携带这些 dist-info，
+# 避免 importlib.metadata 在 onefile 环境中只能回退到离线清单。
+_REFERENCE_DISTRIBUTIONS = [
+    "PyQt6",
+    "esptool",
+    "pyserial",
+    "PyInstaller",
+    "PyYAML",
+    "littlefs-python",
+    "bitstring",
+    "cryptography",
+    "reedsolo",
+    "intelhex",
+    "rich-click",
+    "click",
+]
+
 added_datas = []
 added_binaries = []
 hidden_imports = []
@@ -71,6 +93,12 @@ for pkg in _PACKAGES:
             hidden_imports += collect_submodules(pkg)
         except Exception:
             pass
+
+for distribution in _REFERENCE_DISTRIBUTIONS:
+    try:
+        added_datas += copy_metadata(distribution)
+    except Exception as exc:
+        print(f"[spec] Warning: metadata not collected for {distribution}: {exc}")
 
 # src 子包
 try:
