@@ -79,6 +79,7 @@ from .device_card import DeviceCard
 from .efuse_batch_dialog import BurnEfuseBatchWidget
 from .jump_list import setup_jump_list
 from .efuse_dialog import EFuseDialog
+from .esptool_commands import build_erase_flash_args, is_erase_flash_command
 from .export_dialog import ExportFlashDialog
 from .flow_layout import FlowLayout
 from .helpers import _build_avatar_icon, _build_github_icon, _fetch_remote_avatar_bytes
@@ -1665,11 +1666,9 @@ class OtoolEsptoolUI(QMainWindow):
         if acknowledge:
             self._acknowledge_device(device_id)
         card = self.device_cards[device_id]
-        esptool_args = self._build_esptool_base_args(device_id) + [
-            "erase-region",
-            "0x0",
-            "ALL",
-        ]
+        esptool_args = build_erase_flash_args(
+            self._build_esptool_base_args(device_id)
+        )
         self._start_process(
             card,
             _build_tool_worker_command("esptool", *esptool_args),
@@ -1834,7 +1833,7 @@ class OtoolEsptoolUI(QMainWindow):
             initial_stage_text = "准备导出 Flash"
         elif "write-flash" in command:
             initial_stage_text = "准备连接设备"
-        elif "erase-region" in command:
+        elif is_erase_flash_command(command):
             initial_stage_text = "准备擦除 Flash"
         elif "reset-chip" in command or (len(command) > 0 and command[-1] == "run"):
             initial_stage_text = "准备复位设备"
@@ -2217,6 +2216,15 @@ class OtoolEsptoolUI(QMainWindow):
         return super().eventFilter(source, event)
 
     def closeEvent(self, event) -> None:
+        if self._efuse_batch_widget.has_irreversible_operation():
+            QMessageBox.warning(
+                self,
+                "eFuse 操作尚未完成",
+                "设备正在执行不可逆 eFuse 烧录或结果验证。为避免设备状态未知，"
+                "请等待任务完成后再退出。",
+            )
+            event.ignore()
+            return
         running = [c for c in self.device_cards.values() if c.process is not None]
         if running:
             reply = QMessageBox.question(
