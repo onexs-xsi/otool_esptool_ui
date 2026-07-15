@@ -31,7 +31,7 @@ else:
 # ── 应用信息（单一来源：otool_esptool_ui.py）─────────────────────────────────
 
 _DEFAULT_TITLE = "OTool Esptool UI | byonexs."
-_DEFAULT_VERSION = "0.1.0"
+_DEFAULT_VERSION = "0.6.0"
 _DEFAULT_AUTHOR = "ONEXS"
 
 

@@ -1,6 +1,6 @@
 # OTool Esptool UI
 
-> ESP 多设备识别 / 擦除 / 烧录 / eFuse 桌面工具 · v0.2.0
+> ESP 多设备识别 / 擦除 / 烧录 / eFuse 桌面工具 · v0.6.0
 
 ## Overview
 
