@@ -454,7 +454,8 @@ class EFuseDialog(QDialog):
         self.read_btn.setEnabled(not busy)
         self.stop_read_btn.setEnabled(busy and self._is_reading)
         self.burn_btn.setEnabled(not busy)
-        self.stop_burn_btn.setEnabled(busy and not self._is_reading)
+        # OTP writes are never exposed as killable operations.
+        self.stop_burn_btn.setEnabled(False)
 
     def _burn_efuse(self) -> None:
         name = self.efuse_name_edit.text().strip()
@@ -478,6 +479,11 @@ class EFuseDialog(QDialog):
         self._run_cmd(cmd, log=self.burn_log)
 
     def _stop_process(self) -> None:
+        if self.process is not None and not self._is_reading:
+            self.burn_log.appendPlainText(
+                "[安全保护] eFuse 烧写不可中断，请等待命令结束并核验结果。"
+            )
+            return
         if self.process:
             self.process.kill()
             self.process.deleteLater()
@@ -573,15 +579,13 @@ class EFuseDialog(QDialog):
 
     def closeEvent(self, event) -> None:
         if self.process is not None and not self._is_reading:
-            reply = QMessageBox.warning(
+            QMessageBox.warning(
                 self,
                 "烧写进行中",
-                "eFuse 烧写操作不可逆，中断可能损坏芯片。\n确定要关闭吗？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
+                "eFuse 烧写操作不可逆，应用不会强制终止该进程。\n"
+                "请等待烧写完成并核验结果后再关闭。",
             )
-            if reply != QMessageBox.StandardButton.Yes:
-                event.ignore()
-                return
+            event.ignore()
+            return
         self._stop_process()
         super().closeEvent(event)

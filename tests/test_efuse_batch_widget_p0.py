@@ -76,7 +76,6 @@ class EfuseBatchWidgetP0Tests(unittest.TestCase):
                 "src.efuse_batch_dialog.list_ports.comports",
                 return_value=[_port("COM7", "UNIT-A")],
             ),
-            patch("src.efuse_batch_dialog._identify_chip", return_value="esp32p4"),
             patch.object(self.widget, "_schedule_next"),
         ):
             self.widget._poll_ports()
@@ -97,7 +96,6 @@ class EfuseBatchWidgetP0Tests(unittest.TestCase):
                 "src.efuse_batch_dialog.list_ports.comports",
                 return_value=[_port("COM7", "UNIT-B")],
             ),
-            patch("src.efuse_batch_dialog._identify_chip", return_value="esp32p4"),
             patch.object(self.widget, "_schedule_next"),
         ):
             self.widget._poll_ports()
@@ -133,7 +131,6 @@ class EfuseBatchWidgetP0Tests(unittest.TestCase):
                 "src.efuse_batch_dialog.list_ports.comports",
                 return_value=first_scan,
             ),
-            patch("src.efuse_batch_dialog._identify_chip", return_value="esp32p4"),
             patch.object(self.widget, "_schedule_next"),
         ):
             self.widget._poll_ports()
@@ -153,7 +150,6 @@ class EfuseBatchWidgetP0Tests(unittest.TestCase):
                 "src.efuse_batch_dialog.list_ports.comports",
                 return_value=second_scan,
             ),
-            patch("src.efuse_batch_dialog._identify_chip", return_value="esp32p4"),
             patch.object(self.widget, "_schedule_next"),
         ):
             self.widget._poll_ports()

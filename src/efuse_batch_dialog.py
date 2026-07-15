@@ -53,6 +53,7 @@ from .efuse_batch_safety import (
     evaluate_efuse_verification,
     extract_stable_device_identity,
 )
+from .port_ownership import GLOBAL_PORT_OWNERSHIP, PortLease, PortOwnershipRegistry
 from .styles import BASE_STYLESHEET
 
 # ── 动态芯片列表（来自 esptool，不硬编码）───────────────────────────────────
@@ -114,6 +115,7 @@ class BurnTaskItem:
     transport_warning: str = ""
     process: QProcess | None = None
     process_token: int = 0
+    port_lease: PortLease | None = None
 
 
 # ── 辅助 ─────────────────────────────────────────────────────────────────────
@@ -143,30 +145,6 @@ _STATE_ICONS: dict[BurnTaskState, str] = {
 }
 
 
-def _identify_chip(port: str) -> str:
-    """Run esptool chip_id synchronously to identify the chip. Returns chip name or empty."""
-    import subprocess
-    from .constants import _build_process_env_dict
-
-    cmd = _build_tool_command("esptool", "--port", port, "chip_id")
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=8,
-            cwd=str(TOOL_DIR),
-            env=_build_process_env_dict(),
-        )
-        for pattern in [r"Chip is\s+(.+?)(?:\s+\(|$)", r"Detecting chip type\.*\s*(.+)"]:
-            m = re.search(pattern, result.stdout)
-            if m:
-                return m.group(1).strip()
-    except Exception:
-        pass
-    return ""
-
-
 # ── 主控件 ───────────────────────────────────────────────────────────────────
 
 
@@ -175,8 +153,13 @@ class BurnEfuseBatchWidget(QWidget):
 
     MAX_CONCURRENT = 4
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        port_registry: PortOwnershipRegistry | None = None,
+    ) -> None:
         super().__init__(parent)
+        self._port_registry = port_registry or GLOBAL_PORT_OWNERSHIP
         self._field_configs: list[EfuseFieldConfig] = []
         self._tasks: list[BurnTaskItem] = []
         self._present_transports: dict[str, str] = {}
@@ -647,6 +630,8 @@ class BurnEfuseBatchWidget(QWidget):
                     self._clear_authorization(task)
             if log:
                 self._append_log("自动熔丝已解除武装；未开始烧录的任务授权已撤销")
+        if hasattr(self, "_field_table"):
+            self._update_config_editing_state()
 
     # ── 热插拔轮询 ───────────────────────────────────────────────────────────
 
@@ -735,13 +720,12 @@ class BurnEfuseBatchWidget(QWidget):
         known_ports = {task.port for task in self._tasks}
         for port in sorted(current_ports.keys() - known_ports):
             _description, transport_id = current_ports[port]
-            chip = _identify_chip(port)
             self._connection_generation += 1
             task = BurnTaskItem(
                 device_id=f"{transport_id}#{self._connection_generation}",
                 port=port,
                 transport_id=transport_id,
-                chip_name=chip or "识别中…",
+                chip_name="未识别",
             )
             if self._auto_authorization_id is not None and self._auto_run_config is not None:
                 task.authorization = BurnAuthorization.AUTO
@@ -852,6 +836,10 @@ class BurnEfuseBatchWidget(QWidget):
                         lambda _=False, t=task: self._authorize_manual_burn(t)
                     )
                     btn_lay.addWidget(burn_b)
+                    cancel_b = QPushButton("取消")
+                    cancel_b.setStyleSheet(_btn_ss)
+                    cancel_b.clicked.connect(lambda _=False, t=task: self._cancel_ready_task(t))
+                    btn_lay.addWidget(cancel_b)
             elif task.state == BurnTaskState.SKIPPED:
                 if task.batch_precheck_id is not None:
                     pending = QLabel("批次中已满足")
@@ -871,6 +859,40 @@ class BurnEfuseBatchWidget(QWidget):
             tbl.setCellWidget(row, 5, btn_w)
 
         self._dev_count_lbl.setText(f"{len(self._tasks)} 台")
+        self._update_config_editing_state()
+
+    def _update_config_editing_state(self) -> None:
+        locked_states = {
+            BurnTaskState.READING,
+            BurnTaskState.READ_OK,
+            BurnTaskState.IDENTITY_CHECK,
+            BurnTaskState.BURNING,
+            BurnTaskState.VERIFYING,
+        }
+        locked = (
+            self._auto_run_config is not None
+            or self._pending_batch_config is not None
+            or any(task.state in locked_states for task in self._tasks)
+        )
+        for control in (
+            self._chip_combo,
+            self._baud_combo,
+            self._field_table,
+            self._add_field_btn,
+            self._import_preset_btn,
+        ):
+            control.setEnabled(not locked)
+
+    def _cancel_ready_task(self, task: BurnTaskItem) -> None:
+        if task.state != BurnTaskState.READ_OK:
+            return
+        self._clear_authorization(task)
+        task.batch_precheck_id = None
+        task.state = BurnTaskState.FAILED
+        task.error_message = "用户取消烧录"
+        self._append_log(f"{task.port} 已取消预检结果和烧录授权")
+        self._refresh_dev_table()
+        self._on_task_done(task)
 
     # ── 全局按钮 ─────────────────────────────────────────────────────────────
 
@@ -935,6 +957,7 @@ class BurnEfuseBatchWidget(QWidget):
             task.error_message = "任务配置与批量确认快照不一致，已阻止烧录"
             self._clear_authorization(task)
             self._append_log(f"{task.port} {task.error_message}")
+            self._on_task_done(task)
 
         ready = [
             task
@@ -971,6 +994,10 @@ class BurnEfuseBatchWidget(QWidget):
         )
         if reply != QMessageBox.StandardButton.Yes:
             self._append_log(f"批量 {batch_id} 的不可逆烧录授权已取消")
+            for task in ready:
+                task.state = BurnTaskState.FAILED
+                task.error_message = "用户取消批量烧录授权"
+                self._on_task_done(task)
             self._refresh_dev_table()
             return
 
@@ -1067,6 +1094,11 @@ class BurnEfuseBatchWidget(QWidget):
                 self._kill_task(task)
                 task.state = BurnTaskState.FAILED
                 task.error_message = "用户停止"
+                self._on_task_done(task)
+            elif task.state == BurnTaskState.READ_OK:
+                task.state = BurnTaskState.FAILED
+                task.error_message = "用户停止"
+                self._on_task_done(task)
         self._refresh_dev_table()
 
     # ── 状态机 ───────────────────────────────────────────────────────────────
@@ -1168,6 +1200,22 @@ class BurnEfuseBatchWidget(QWidget):
             self._refresh_dev_table()
             self._on_task_done(task)
             return False
+        lease = self._port_registry.acquire(
+            task.port,
+            owner=f"efuse-batch:{task.device_id}",
+            purpose="批量 eFuse",
+        )
+        if lease is None:
+            claim = self._port_registry.claim_for(task.port)
+            task.state = BurnTaskState.FAILED
+            task.error_message = (
+                f"串口正由 {claim.purpose} 占用" if claim is not None else "串口被占用"
+            )
+            self._append_log(f"{task.port} {task.error_message}")
+            self._refresh_dev_table()
+            self._on_task_done(task)
+            return False
+        task.port_lease = lease
         task.state = BurnTaskState.READING
         task.error_message = ""
         task.fields_to_burn.clear()
@@ -1245,6 +1293,20 @@ class BurnEfuseBatchWidget(QWidget):
         return any(
             task.state in (BurnTaskState.BURNING, BurnTaskState.VERIFYING)
             for task in self._tasks
+        )
+
+    def active_task_count(self) -> int:
+        return sum(
+            1
+            for task in self._tasks
+            if task.state
+            in {
+                BurnTaskState.READING,
+                BurnTaskState.READ_OK,
+                BurnTaskState.IDENTITY_CHECK,
+                BurnTaskState.BURNING,
+                BurnTaskState.VERIFYING,
+            }
         )
 
     def _do_burn(self, task: BurnTaskItem) -> None:
@@ -1513,6 +1575,10 @@ class BurnEfuseBatchWidget(QWidget):
     def _on_task_done(self, task: BurnTaskItem) -> None:
         """任务结束（成功/跳过/失败）后调度下一个。"""
         self._clear_authorization(task)
+        if task.port_lease is not None:
+            task.port_lease.release()
+            task.port_lease = None
+        self._update_config_editing_state()
         QTimer.singleShot(0, self._schedule_next)
         QTimer.singleShot(0, self._maybe_confirm_pending_batch)
 
@@ -1608,6 +1674,9 @@ class BurnEfuseBatchWidget(QWidget):
             process.kill()
             process.waitForFinished(500)
             process.deleteLater()
+        if task.port_lease is not None:
+            task.port_lease.release()
+            task.port_lease = None
 
     # ── 解析 ─────────────────────────────────────────────────────────────────
 

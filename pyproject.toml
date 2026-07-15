@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "otool-esptool-ui"
-version = "0.6.1"
+version = "0.6.2"
 description = "PyQt6 GUI for mass-detecting and flashing ESP devices with esptool"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -38,3 +38,12 @@ packages = ["otool_esptool_ui", "otool_esptool_ui.src"]
 
 [tool.setuptools.package-dir]
 otool_esptool_ui = "."
+
+[tool.setuptools.package-data]
+otool_esptool_ui = [
+    "config.yaml",
+    "THIRD_PARTY_NOTICES.md",
+    "logo_all_size.ico",
+    "assets/*.png",
+]
+"otool_esptool_ui.src" = ["assets/*.svg"]

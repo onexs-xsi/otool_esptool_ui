@@ -31,7 +31,9 @@ from PyQt6.QtWidgets import (
 )
 from serial.tools import list_ports
 
+from .port_ownership import GLOBAL_PORT_OWNERSHIP, PortLease, PortOwnershipRegistry
 from .styles import BASE_STYLESHEET
+from .terminal_decode import decode_payload_chunks
 
 
 TERMINAL_BAUD_OPTIONS = [
@@ -99,6 +101,7 @@ class TerminalSession:
     record_hex_overrides: dict[int, bool] = field(default_factory=dict)
     send_history: list[str] = field(default_factory=list)
     serial_thread: "TerminalSerialThread | None" = None
+    port_lease: PortLease | None = None
     listening: bool = False
     closing_requested: bool = False
 
@@ -221,8 +224,13 @@ class TerminalWidget(QWidget):
 
     _MAX_RECORDS = 4000
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        port_registry: PortOwnershipRegistry | None = None,
+    ) -> None:
         super().__init__(parent)
+        self._port_registry = port_registry or GLOBAL_PORT_OWNERSHIP
         self._records: list[TerminalLogRecord] = []
         self._next_record_id = 1
         self._record_hex_overrides: dict[int, bool] = {}
@@ -771,6 +779,21 @@ class TerminalWidget(QWidget):
             session = self._sessions[session_id]
         self._timer_for_session(session_id).stop()
         session.closing_requested = False
+        lease = self._port_registry.acquire(
+            config.port,
+            owner=f"terminal:{session_id}",
+            purpose="串口终端",
+        )
+        if lease is None:
+            claim = self._port_registry.claim_for(config.port)
+            detail = f"（{claim.purpose}）" if claim is not None else ""
+            self._set_session_status(session_id, "串口忙")
+            self._append_sys(
+                f"{config.port} 正由其他工作台占用{detail}",
+                session_id=session_id,
+            )
+            return
+        session.port_lease = lease
         self._set_status("连接中", "idle")
         self._set_session_status(session_id, "连接中")
         self._append_sys(
@@ -850,6 +873,9 @@ class TerminalWidget(QWidget):
         if not self._port_is_available(config.port):
             self._set_session_status(session_id, "监听中")
             return
+        if not self._port_registry.is_available(config.port):
+            self._set_session_status(session_id, "串口忙")
+            return
         self._append_sys(f"监听检测到 {config.port}，正在自动重连", session_id=session_id)
         self._start_serial_thread(config, session_id=session_id)
 
@@ -869,14 +895,33 @@ class TerminalWidget(QWidget):
         if not timer.isActive():
             timer.start()
 
-    def shutdown(self) -> None:
+    def shutdown(self, wait_ms: int = 3000) -> bool:
         for timer in self._reconnect_timers.values():
             timer.stop()
+        threads: list[tuple[TerminalSession, TerminalSerialThread]] = []
         for session in self._sessions.values():
+            session.listening = False
             thread = session.serial_thread
             if thread is not None:
                 thread.request_stop()
-                thread.wait(1200)
+                threads.append((session, thread))
+        deadline = time.monotonic() + max(0, wait_ms) / 1000
+        all_stopped = True
+        for session, thread in threads:
+            remaining = max(0, int((deadline - time.monotonic()) * 1000))
+            stopped = thread.wait(remaining)
+            all_stopped = all_stopped and stopped
+            if stopped:
+                session.serial_thread = None
+                if session.port_lease is not None:
+                    session.port_lease.release()
+                    session.port_lease = None
+        return all_stopped
+
+    def active_connection_count(self) -> int:
+        return sum(
+            1 for session in self._sessions.values() if session.serial_thread is not None
+        )
 
     def _serial_opened(self, session_id: int, message: str) -> None:
         self._set_session_status(session_id, "已连接")
@@ -900,6 +945,9 @@ class TerminalWidget(QWidget):
             self._append_sys("串口连接已关闭", session_id=session_id)
             self._set_session_status(session_id, "已关闭")
         session.serial_thread = None
+        if session.port_lease is not None:
+            session.port_lease.release()
+            session.port_lease = None
         session.closing_requested = False
         if session.listening:
             self._schedule_listener_reconnect(session_id)
@@ -1458,13 +1506,14 @@ class TerminalWidget(QWidget):
         timestamp_enabled = self._timestamp_check.isChecked()
         hex_enabled = self._hex_check.isChecked()
         encoding = self._current_encoding()
+        decoded_payloads = self._decode_record_streams(encoding)
         terminal_simple = mode == "terminal" and not timestamp_enabled and not hex_enabled
 
         if terminal_simple:
             parts: list[str] = []
             for record in self._records:
                 if record.direction == "RX":
-                    parts.append(self._decode_payload(record.payload, encoding))
+                    parts.append(decoded_payloads.get(record.record_id, ""))
                 elif record.direction == "SYS":
                     parts.append(f"\n[SYS] {record.message}\n")
             if self._terminal_inline_input:
@@ -1474,7 +1523,12 @@ class TerminalWidget(QWidget):
         if timestamp_enabled:
             lines: list[str] = []
             for record in self._records:
-                formatted = self._format_record_html(record, encoding, hex_enabled)
+                formatted = self._format_record_html(
+                    record,
+                    encoding,
+                    hex_enabled,
+                    decoded_payloads.get(record.record_id),
+                )
                 if formatted:
                     lines.append(formatted)
             if mode == "terminal" and self._terminal_inline_input:
@@ -1484,7 +1538,12 @@ class TerminalWidget(QWidget):
 
         lines: list[str] = []
         for record in self._records:
-            formatted = self._format_record_plain(record, encoding, hex_enabled)
+            formatted = self._format_record_plain(
+                record,
+                encoding,
+                hex_enabled,
+                decoded_payloads.get(record.record_id),
+            )
             if formatted:
                 lines.append(formatted)
         if mode == "terminal" and self._terminal_inline_input:
@@ -1496,6 +1555,7 @@ class TerminalWidget(QWidget):
         record: TerminalLogRecord,
         encoding: str,
         hex_enabled: bool,
+        decoded_text: str | None = None,
     ) -> str:
         if record.direction == "SYS":
             return f"[SYS] {record.message}"
@@ -1503,7 +1563,11 @@ class TerminalWidget(QWidget):
         if hex_enabled:
             body = _format_hex(record.payload)
         else:
-            body = self._decode_payload(record.payload, encoding)
+            body = (
+                decoded_text
+                if decoded_text is not None
+                else self._decode_payload(record.payload, encoding)
+            )
             body = self._normalize_display_text(body)
 
         return f"[{record.direction}] {body}"
@@ -1513,6 +1577,7 @@ class TerminalWidget(QWidget):
         record: TerminalLogRecord,
         encoding: str,
         global_hex_enabled: bool,
+        decoded_text: str | None = None,
     ) -> str:
         time_prefix = record.timestamp.strftime("%H:%M:%S.%f")[:-3]
         if record.direction == "SYS":
@@ -1525,7 +1590,9 @@ class TerminalWidget(QWidget):
             toggle_text = "文本"
         else:
             body = self._normalize_display_text(
-                self._decode_payload(record.payload, encoding)
+                decoded_text
+                if decoded_text is not None
+                else self._decode_payload(record.payload, encoding)
             )
             toggle_text = "HEX"
         label = f"[{time_prefix} {record.direction} {len(record.payload)}B]"
@@ -1619,6 +1686,17 @@ class TerminalWidget(QWidget):
             return payload.decode(encoding, errors="replace")
         except LookupError:
             return payload.decode("utf-8", errors="replace")
+
+    def _decode_record_streams(self, encoding: str) -> dict[int, str]:
+        """Decode RX and TX as independent streams across serial chunk boundaries."""
+        decoded: dict[int, str] = {}
+        for direction in ("RX", "TX"):
+            records = [item for item in self._records if item.direction == direction]
+            texts = decode_payload_chunks((item.payload for item in records), encoding)
+            decoded.update(
+                (item.record_id, text) for item, text in zip(records, texts, strict=True)
+            )
+        return decoded
 
     def _normalize_display_text(self, text: str) -> str:
         return text.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")

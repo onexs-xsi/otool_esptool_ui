@@ -32,6 +32,7 @@ from serial.tools import list_ports
 
 from .constants import TOOL_DIR, _build_process_env_dict, _build_tool_command
 from .dialog_memory import get_open_file_name, get_save_file_name
+from .port_ownership import GLOBAL_PORT_OWNERSHIP, PortLease, PortOwnershipRegistry
 from .styles import BASE_STYLESHEET
 from .verify_plan import (
     DEFAULT_VERIFY_PROFILE_NAME,
@@ -135,6 +136,7 @@ class VerifyTaskItem:
     captured_values: dict[str, str] = field(default_factory=dict)
     thread: QThread | None = None
     worker: "VerifyWorker | None" = None
+    port_lease: PortLease | None = None
 
 
 class VerifyWorker(QObject):
@@ -607,8 +609,13 @@ class VerifyWidget(QWidget):
 
     MAX_CONCURRENT = 4
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        port_registry: PortOwnershipRegistry | None = None,
+    ) -> None:
         super().__init__(parent)
+        self._port_registry = port_registry or GLOBAL_PORT_OWNERSHIP
         self._profiles: dict[str, VerifyProfile] = {}
         self._tasks: list[VerifyTaskItem] = []
         self._auto_mode = False
@@ -1541,6 +1548,22 @@ class VerifyWidget(QWidget):
             return
         if task.state == VerifyTaskState.RUNNING:
             return
+        lease = self._port_registry.acquire(
+            task.port,
+            owner=f"verify:{task.device_id}",
+            purpose="设备校验",
+        )
+        if lease is None:
+            claim = self._port_registry.claim_for(task.port)
+            task.state = VerifyTaskState.FAILED
+            task.current_step = "串口被占用"
+            task.error_message = (
+                f"串口正由 {claim.purpose} 占用" if claim is not None else "串口被占用"
+            )
+            self._append_log(f"{task.port} {task.error_message}")
+            self._refresh_dev_table()
+            return
+        task.port_lease = lease
         task.state = VerifyTaskState.RUNNING
         task.current_step = "准备启动"
         task.result_summary = ""
@@ -1556,6 +1579,7 @@ class VerifyWidget(QWidget):
         worker.finished.connect(lambda outcome, summary, t=task: self._on_task_finished(t, outcome, summary))
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(lambda t=task, th=thread: self._on_task_thread_finished(t, th))
         thread.finished.connect(thread.deleteLater)
         task.worker = worker
         task.thread = thread
@@ -1611,7 +1635,9 @@ class VerifyWidget(QWidget):
                     and task.worker is None
                 ):
                     self._start_task(task, profile=profile)
-                    running += 1
+                    running = sum(
+                        item.state == VerifyTaskState.RUNNING for item in self._tasks
+                    )
             if not any(
                 task.port in self._batch_ports and task.state == VerifyTaskState.WAITING
                 for task in self._tasks
@@ -1630,7 +1656,9 @@ class VerifyWidget(QWidget):
                     break
                 if task.selected and task.state == VerifyTaskState.WAITING and task.worker is None:
                     self._start_task(task, profile=profile)
-                    running += 1
+                    running = sum(
+                        item.state == VerifyTaskState.RUNNING for item in self._tasks
+                    )
 
     def _on_task_step_changed(self, task: VerifyTaskItem, step_text: str) -> None:
         task.current_step = step_text
@@ -1648,7 +1676,6 @@ class VerifyWidget(QWidget):
 
     def _on_task_finished(self, task: VerifyTaskItem, outcome: str, summary: str) -> None:
         task.worker = None
-        task.thread = None
         task.current_step = "-"
         if outcome == "passed":
             task.state = VerifyTaskState.PASSED
@@ -1669,6 +1696,14 @@ class VerifyWidget(QWidget):
         self._refresh_dev_table()
         if self._auto_mode or self._run_all_requested:
             QTimer.singleShot(0, self._schedule_next)
+
+    def _on_task_thread_finished(self, task: VerifyTaskItem, thread: QThread) -> None:
+        if task.thread is not thread:
+            return
+        task.thread = None
+        if task.port_lease is not None:
+            task.port_lease.release()
+            task.port_lease = None
 
     def _abort_task(self, task: VerifyTaskItem) -> None:
         if task.worker is None:
@@ -1699,6 +1734,28 @@ class VerifyWidget(QWidget):
                 task.current_step = "停止中"
                 task.worker.request_stop()
         self._refresh_dev_table()
+
+    def active_task_count(self) -> int:
+        return sum(
+            1 for task in self._tasks if task.worker is not None or task.thread is not None
+        )
+
+    def shutdown(self, wait_ms: int = 3000) -> bool:
+        """Request cooperative stops and wait for worker threads before exit."""
+        self.stop_all_tasks()
+        deadline = time.monotonic() + max(0, wait_ms) / 1000
+        all_stopped = True
+        for task in self._tasks:
+            thread = task.thread
+            if thread is None:
+                continue
+            remaining = max(0, int((deadline - time.monotonic()) * 1000))
+            stopped = thread.wait(remaining)
+            all_stopped = all_stopped and stopped
+            if stopped and task.port_lease is not None:
+                task.port_lease.release()
+                task.port_lease = None
+        return all_stopped
 
     def _append_log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")

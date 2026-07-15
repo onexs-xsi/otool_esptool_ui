@@ -48,6 +48,8 @@ from .constants import (
     _tool_backend_available,
 )
 from .dialog_memory import get_existing_directory, get_open_file_name, get_save_file_name
+from .flash_size import parse_detected_flash_size
+from .port_ownership import GLOBAL_PORT_OWNERSHIP, PortLease, PortOwnershipRegistry
 
 # ── 动态芯片列表 ─────────────────────────────────────────────────────────────
 try:
@@ -203,7 +205,7 @@ def analyze_merged_bin(data: bytes, chip: str = "auto") -> dict:
         result["partitions"].append({
             "name": e["name"], "offset": off, "size": sz,
             "type_str": e["type_str"], "subtype_str": e["subtype_str"],
-            "empty": is_empty,
+            "empty": is_empty, "encrypted": e["encrypted"],
         })
     return result
 
@@ -523,9 +525,17 @@ class MergeSplitWidget(QWidget):
 
     send_to_flash_station = pyqtSignal(str)
 
-    def __init__(self, parent: QWidget | None = None):
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        port_registry: PortOwnershipRegistry | None = None,
+    ):
         super().__init__(parent)
+        self._port_registry = port_registry or GLOBAL_PORT_OWNERSHIP
         self._merge_process: QProcess | None = None
+        self._split_device_process: QProcess | None = None
+        self._split_device_lease: PortLease | None = None
+        self._split_device_temp_path = ""
         self._merge_rows: list[_EntryRow] = []
         self._split_data: bytes = b""
         self._split_result: dict | None = None
@@ -899,25 +909,45 @@ class MergeSplitWidget(QWidget):
         # 同步芯片到分解区
         self._split_chip_combo.setCurrentText(chip)
 
-        # 用 esptool 读取 Flash 到临时文件
+        lease = self._port_registry.acquire(
+            port,
+            owner=f"merge-split:{id(self)}",
+            purpose="从设备读取 Flash",
+        )
+        if lease is None:
+            claim = self._port_registry.claim_for(port)
+            detail = f"（{claim.purpose}）" if claim is not None else ""
+            QMessageBox.information(self, "串口被占用", f"{port} 正在使用中{detail}。")
+            return
+        self._split_device_lease = lease
+
+        # 用 esptool 先检测真实容量，再读取完整 Flash 到临时文件。
         import tempfile
         tmp = tempfile.NamedTemporaryFile(suffix=".bin", delete=False)
         tmp_path = tmp.name
         tmp.close()
-
-        # 读取 4MB（足够包含分区表+常见分区头）
-        read_size = "0x400000"
+        self._split_device_temp_path = tmp_path
         chip_arg = chip if chip != "auto" else "auto"
-        cmd = list(_build_tool_command(
-            "esptool", "--chip", chip_arg, "--port", port,
-            "read_flash", "0x0", read_size, tmp_path,
+        probe_cmd = list(_build_tool_command(
+            "esptool", "--chip", chip_arg, "--port", port, "flash-id",
         ))
-        self._append_log(f"═══ 从设备读取 Flash: {port} ═══")
-        self._append_log("命令: " + subprocess.list2cmdline(cmd))
-        self._split_analyze_btn.setEnabled(False)
-        self._split_from_device_btn.setEnabled(False)
+        self._set_split_device_busy(True)
+        self._append_log(f"═══ 检测设备 Flash 容量: {port} ═══")
+        self._append_log("命令: " + subprocess.list2cmdline(probe_cmd))
+        self._start_split_device_command(
+            probe_cmd,
+            lambda code, output: self._on_split_device_probe_finished(
+                code, output, port, chip_arg, tmp_path
+            ),
+        )
 
+    def _set_split_device_busy(self, busy: bool) -> None:
+        self._split_analyze_btn.setEnabled(not busy)
+        self._split_from_device_btn.setEnabled(not busy)
+
+    def _start_split_device_command(self, cmd: list[str], callback) -> None:
         proc = QProcess(self)
+        self._split_device_process = proc
         proc.setProgram(cmd[0])
         proc.setArguments(cmd[1:])
         proc.setWorkingDirectory(str(TOOL_DIR))
@@ -926,22 +956,102 @@ class MergeSplitWidget(QWidget):
         _inject_local_esptool_pythonpath(env)
         env.insert("PYTHONUTF8", "1")
         proc.setProcessEnvironment(env)
-        proc.readyRead.connect(lambda: self._append_log(
-            decode_process_output(bytes(proc.readAll())).rstrip()
-        ))
+        output_parts: list[str] = []
+        completed = False
 
-        def _on_finished(exit_code, _):
-            self._split_analyze_btn.setEnabled(True)
-            self._split_from_device_btn.setEnabled(True)
-            if exit_code != 0:
-                self._append_log(f"✕ 读取失败 (exit {exit_code})")
+        def _read_output() -> None:
+            text = decode_process_output(bytes(proc.readAll()))
+            if text:
+                output_parts.append(text)
+                self._append_log(text.rstrip())
+
+        def _complete(exit_code: int) -> None:
+            nonlocal completed
+            if completed:
                 return
-            self._append_log("✓ 读取完成，开始分析…")
-            self._split_input_edit.setText(tmp_path)
-            self._split_do_analyze(tmp_path)
+            completed = True
+            _read_output()
+            if self._split_device_process is not proc:
+                proc.deleteLater()
+                return
+            self._split_device_process = None
+            proc.deleteLater()
+            callback(exit_code, "".join(output_parts))
 
-        proc.finished.connect(_on_finished)
+        def _finished(exit_code: int, _status) -> None:
+            _complete(exit_code)
+
+        def _error(error: QProcess.ProcessError) -> None:
+            if error == QProcess.ProcessError.FailedToStart:
+                _complete(-1)
+
+        proc.readyRead.connect(_read_output)
+        proc.finished.connect(_finished)
+        proc.errorOccurred.connect(_error)
         proc.start()
+
+    def _on_split_device_probe_finished(
+        self,
+        exit_code: int,
+        output: str,
+        port: str,
+        chip_arg: str,
+        tmp_path: str,
+    ) -> None:
+        flash_size = parse_detected_flash_size(output) if exit_code == 0 else None
+        if flash_size is None:
+            self._append_log(
+                "✕ 无法可靠识别 Flash 容量，已停止读取以避免固定容量造成截断。"
+            )
+            self._finish_split_device_read(success=False)
+            return
+        self._append_log(f"✓ 检测容量：{_human_size(flash_size)}")
+        read_cmd = list(_build_tool_command(
+            "esptool", "--chip", chip_arg, "--port", port,
+            "read-flash", "0x0", hex(flash_size), tmp_path,
+        ))
+        self._append_log("命令: " + subprocess.list2cmdline(read_cmd))
+        self._start_split_device_command(
+            read_cmd,
+            lambda code, _output: self._on_split_device_read_finished(code, tmp_path),
+        )
+
+    def _on_split_device_read_finished(self, exit_code: int, tmp_path: str) -> None:
+        if exit_code != 0:
+            self._append_log(f"✕ 读取失败 (exit {exit_code})")
+            self._finish_split_device_read(success=False)
+            return
+        self._append_log("✓ 完整 Flash 读取完成，开始分析…")
+        self._split_input_edit.setText(tmp_path)
+        self._finish_split_device_read(success=True)
+        self._split_do_analyze(tmp_path)
+
+    def _finish_split_device_read(self, *, success: bool) -> None:
+        self._set_split_device_busy(False)
+        if self._split_device_lease is not None:
+            self._split_device_lease.release()
+            self._split_device_lease = None
+        if not success and self._split_device_temp_path:
+            try:
+                Path(self._split_device_temp_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+        self._split_device_temp_path = ""
+
+    def has_active_device_read(self) -> bool:
+        return self._split_device_process is not None
+
+    def shutdown(self, wait_ms: int = 1500) -> bool:
+        proc = self._split_device_process
+        if proc is None:
+            self._finish_split_device_read(success=False)
+            return True
+        proc.kill()
+        stopped = proc.waitForFinished(max(0, wait_ms))
+        self._split_device_process = None
+        proc.deleteLater()
+        self._finish_split_device_read(success=False)
+        return stopped
 
     def _split_analyze(self) -> None:
         path = self._split_input_edit.text().strip()

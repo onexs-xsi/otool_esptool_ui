@@ -138,7 +138,7 @@ custom_datas = [
     (str(TOOL_DIR / "THIRD_PARTY_NOTICES.md"), "."),
     (str(TOOL_DIR / "assets" / "onexs_avatar.png"), "assets"),
     (str(TOOL_DIR / "config.yaml"), "."),
-    (str(TOOL_DIR / "src" / "assets" / "chevron_down.svg"), "src/assets"),
+    (str(TOOL_DIR / "src" / "assets"), "src/assets"),
     (str(TOOL_DIR / "logo_all_size.ico"), "."),
     (str(TOOL_DIR / "otool_esptool_ui.py"), "."),  # 运行时读取版本号
 ]
