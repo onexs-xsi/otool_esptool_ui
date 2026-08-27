@@ -53,6 +53,7 @@ _PACKAGES = [
     # so the native Rust extension is present in every frozen build.
     "cryptography",
     "serial",
+    "pyte",
     "bitstring",
 ]
 
@@ -62,6 +63,8 @@ _REFERENCE_DISTRIBUTIONS = [
     "PyQt6",
     "esptool",
     "pyserial",
+    "pyte",
+    "wcwidth",
     "PyInstaller",
     "PyYAML",
     "littlefs-python",

@@ -34,6 +34,7 @@ from serial.tools import list_ports
 from .port_ownership import GLOBAL_PORT_OWNERSHIP, PortLease, PortOwnershipRegistry
 from .styles import BASE_STYLESHEET
 from .terminal_decode import decode_payload_chunks
+from .unix_terminal import UnixTerminalEmulator, encode_unix_key, normalize_pasted_text
 
 
 TERMINAL_BAUD_OPTIONS = [
@@ -96,7 +97,7 @@ class TerminalSession:
     timestamp_enabled: bool = False
     hex_enabled: bool = False
     auto_follow: bool = True
-    inline_input: str = ""
+    unix_terminal: UnixTerminalEmulator = field(default_factory=UnixTerminalEmulator)
     records: list[TerminalLogRecord] = field(default_factory=list)
     record_hex_overrides: dict[int, bool] = field(default_factory=dict)
     send_history: list[str] = field(default_factory=list)
@@ -222,6 +223,8 @@ class TerminalSerialThread(QThread):
 class TerminalWidget(QWidget):
     """串口终端台。"""
 
+    compactModeChanged = pyqtSignal(bool)
+
     _MAX_RECORDS = 4000
 
     def __init__(
@@ -249,7 +252,8 @@ class TerminalWidget(QWidget):
         self._history_draft = ""
         self._updating_log_scroll = False
         self._updating_session_controls = False
-        self._terminal_inline_input = ""
+        self._fullscreen_restore_geometry = None
+        self._fullscreen_restore_state = None
         self._init_ui()
         self._apply_style()
         self._new_session()
@@ -310,13 +314,21 @@ class TerminalWidget(QWidget):
         header.addWidget(self._copy_btn)
         header.addWidget(self._clear_btn)
 
-        grid = QGridLayout()
+        self._serial_config_widget = QWidget()
+        grid = QGridLayout(self._serial_config_widget)
+        grid.setContentsMargins(0, 0, 0, 0)
         grid.setHorizontalSpacing(8)
         grid.setVerticalSpacing(6)
 
         self._mode_combo = QComboBox()
         self._mode_combo.addItem("标准终端", "terminal")
+        self._mode_combo.addItem("Unix 终端", "unix")
         self._mode_combo.addItem("文本终端", "plain")
+        self._mode_combo.setItemData(
+            self._mode_combo.findData("unix"),
+            "ANSI/VT100 屏幕仿真；直接输入并支持终端控制键",
+            Qt.ItemDataRole.ToolTipRole,
+        )
         self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
 
         self._port_combo = QComboBox()
@@ -391,8 +403,29 @@ class TerminalWidget(QWidget):
         grid.addWidget(self._reset_btn, 1, 9)
         grid.setColumnStretch(10, 1)
 
+        self._compact_btn = QPushButton("精简")
+        self._compact_btn.setObjectName("terminalViewToggle")
+        self._compact_btn.setCheckable(True)
+        self._compact_btn.setFixedWidth(90)
+        self._compact_btn.setToolTip("隐藏其他工作台和应用信息，仅保留串口终端")
+        self._compact_btn.toggled.connect(self._on_compact_toggled)
+        self._fullscreen_btn = QPushButton("全屏")
+        self._fullscreen_btn.setObjectName("terminalViewToggle")
+        self._fullscreen_btn.setCheckable(True)
+        self._fullscreen_btn.setFixedWidth(90)
+        self._fullscreen_btn.setToolTip("切换应用全屏显示；可与精简模式同时启用")
+        self._fullscreen_btn.toggled.connect(self._on_fullscreen_toggled)
+
+        config_row = QHBoxLayout()
+        config_row.setContentsMargins(0, 0, 0, 0)
+        config_row.setSpacing(8)
+        config_row.addWidget(self._serial_config_widget, 100)
+        config_row.addStretch(1)
+        config_row.addWidget(self._compact_btn, alignment=Qt.AlignmentFlag.AlignBottom)
+        config_row.addWidget(self._fullscreen_btn, alignment=Qt.AlignmentFlag.AlignBottom)
+
         control_layout.addLayout(header)
-        control_layout.addLayout(grid)
+        control_layout.addLayout(config_row)
 
         self._log = QTextBrowser()
         self._log.setObjectName("terminalLog")
@@ -403,6 +436,7 @@ class TerminalWidget(QWidget):
         self._log.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
         self._log.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._log.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._log.setAttribute(Qt.WidgetAttribute.WA_InputMethodEnabled, True)
         self._log.installEventFilter(self)
         self._log.verticalScrollBar().valueChanged.connect(self._on_log_scroll_changed)
         mono = QFont()
@@ -411,16 +445,42 @@ class TerminalWidget(QWidget):
         mono.setPointSize(10)
         self._log.setFont(mono)
 
-        input_frame = QFrame()
-        input_frame.setObjectName("sectionFrame")
-        input_layout = QVBoxLayout(input_frame)
+        self._input_frame = QFrame()
+        self._input_frame.setObjectName("sectionFrame")
+        input_layout = QVBoxLayout(self._input_frame)
         input_layout.setContentsMargins(12, 8, 12, 8)
         input_layout.setSpacing(6)
 
         input_header = QHBoxLayout()
         input_header.setSpacing(8)
-        input_title = QLabel("发送")
-        input_title.setObjectName("sectionTitle")
+        self._input_title = QLabel("发送")
+        self._input_title.setObjectName("sectionTitle")
+        self._unix_input_hint = QLabel("点击终端后直接输入")
+        self._unix_input_hint.setObjectName("terminalSessionHint")
+        self._unix_input_hint.hide()
+        self._unix_quick_buttons: dict[str, QPushButton] = {}
+        for label, payload, tooltip in (
+            ("Ctrl+V", None, "粘贴剪贴板内容"),
+            ("Tab", b"\t", "命令或路径补全"),
+            ("↑", b"\x1b[A", "上一条历史命令 / 向上移动"),
+            ("↓", b"\x1b[B", "下一条历史命令 / 向下移动"),
+            ("Ctrl+L", b"\x0c", "清屏并请求终端重绘"),
+            ("Esc", b"\x1b", "退出当前菜单或操作"),
+        ):
+            button = QPushButton(label)
+            button.setObjectName("terminalQuickKeyButton")
+            button.setToolTip(tooltip)
+            button.setFixedHeight(30)
+            button.setMinimumWidth(36 if label in {"↑", "↓"} else 48)
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            if payload is None:
+                button.clicked.connect(self._paste_unix_terminal)
+            else:
+                button.clicked.connect(
+                    lambda _checked=False, data=payload: self._send_unix_quick_bytes(data)
+                )
+            button.hide()
+            self._unix_quick_buttons[label] = button
         self._encoding_combo = QComboBox()
         self._encoding_combo.setEditable(True)
         for encoding in ENCODING_OPTIONS:
@@ -436,7 +496,10 @@ class TerminalWidget(QWidget):
         self._newline_combo.setCurrentIndex(1)
         self._newline_combo.currentIndexChanged.connect(self._save_active_session_properties)
 
-        input_header.addWidget(input_title)
+        input_header.addWidget(self._input_title)
+        input_header.addWidget(self._unix_input_hint)
+        for button in self._unix_quick_buttons.values():
+            input_header.addWidget(button)
         input_header.addStretch(1)
         input_header.addWidget(self._make_label("编码"))
         input_header.addWidget(self._encoding_combo)
@@ -491,7 +554,7 @@ class TerminalWidget(QWidget):
 
         root.addWidget(control_frame)
         root.addWidget(self._log, 1)
-        root.addWidget(input_frame)
+        root.addWidget(self._input_frame)
 
     def _build_send_input_page(self, input_widget: QWidget, send_button: QPushButton) -> QWidget:
         page = QWidget()
@@ -630,6 +693,39 @@ class TerminalWidget(QWidget):
             }
             QPushButton#terminalInlineSendButton:pressed {
                 background: #153d91;
+            }
+            QPushButton#terminalQuickKeyButton {
+                background: #eef2ff;
+                border: 1px solid #c7d2fe;
+                border-radius: 6px;
+                color: #334155;
+                font-weight: 700;
+                padding: 3px 8px;
+            }
+            QPushButton#terminalQuickKeyButton:hover {
+                background: #dbeafe;
+                border-color: #93c5fd;
+                color: #1d4ed8;
+            }
+            QPushButton#terminalQuickKeyButton:pressed {
+                background: #bfdbfe;
+            }
+            QPushButton#terminalViewToggle {
+                background: #f8fafc;
+                border: 1px solid #cbd5e1;
+                border-radius: 7px;
+                color: #334155;
+                font-weight: 700;
+                padding: 5px 14px;
+            }
+            QPushButton#terminalViewToggle:hover {
+                background: #eef2ff;
+                border-color: #a5b4fc;
+            }
+            QPushButton#terminalViewToggle:checked {
+                background: #2560e0;
+                border-color: #1a4db5;
+                color: #ffffff;
             }
             QCheckBox {
                 color: #374151;
@@ -1027,7 +1123,6 @@ class TerminalWidget(QWidget):
         session.auto_follow = self._auto_follow_btn.isChecked()
         session.listening = self._listen_btn.isChecked()
         session.send_history = self._send_history
-        session.inline_input = self._terminal_inline_input
         config = self._collect_config(show_errors=False)
         if config is not None:
             self._update_session_config(session, config)
@@ -1106,7 +1201,6 @@ class TerminalWidget(QWidget):
         self._records = session.records
         self._record_hex_overrides = session.record_hex_overrides
         self._send_history = session.send_history
-        self._terminal_inline_input = session.inline_input
         self._history_index = None
         self._history_draft = ""
         self._updating_session_controls = True
@@ -1134,7 +1228,7 @@ class TerminalWidget(QWidget):
             self._set_combo_data(self._stopbits_combo, serial.STOPBITS_ONE)
             self._set_combo_data(self._flow_combo, "none")
         self._updating_session_controls = False
-        self._input_stack.setCurrentIndex(0 if session.mode == "terminal" else 1)
+        self._update_mode_input_ui(session.mode)
         self._set_status(session.status, self._state_for_session_status(session.status))
         self._update_active_connection_controls()
         self._refresh_session_table()
@@ -1209,13 +1303,75 @@ class TerminalWidget(QWidget):
     def _switch_session(self, session_id: int) -> None:
         self._save_active_session_properties()
         self._activate_session(session_id)
-        self._terminal_input.setFocus()
+        self._focus_mode_input()
 
     def _on_mode_changed(self) -> None:
         mode = self._current_mode()
-        self._input_stack.setCurrentIndex(0 if mode == "terminal" else 1)
+        self._update_mode_input_ui(mode)
         self._save_active_session_properties()
         self._schedule_render()
+        if not self._updating_session_controls:
+            self._focus_mode_input()
+
+    def set_mode(self, mode: str) -> bool:
+        """Select a terminal type, including requests from Windows Jump List."""
+
+        index = self._mode_combo.findData(mode)
+        if index < 0:
+            return False
+        self._mode_combo.setCurrentIndex(index)
+        return True
+
+    def _on_compact_toggled(self, checked: bool) -> None:
+        keep_fullscreen = self._fullscreen_btn.isChecked()
+        top_level = self.window()
+        self._compact_btn.setToolTip(
+            "恢复完整应用界面" if checked else "隐藏其他工作台和应用信息，仅保留串口终端"
+        )
+        self.compactModeChanged.emit(checked)
+        if keep_fullscreen:
+            top_level.showFullScreen()
+        self._log.setFocus()
+
+    def _on_fullscreen_toggled(self, checked: bool) -> None:
+        top_level = self.window()
+        if checked:
+            self._fullscreen_restore_geometry = top_level.saveGeometry()
+            self._fullscreen_restore_state = top_level.windowState()
+            top_level.showFullScreen()
+            self._fullscreen_btn.setToolTip("退出全屏显示")
+        else:
+            restore_geometry = self._fullscreen_restore_geometry
+            restore_state = self._fullscreen_restore_state
+            top_level.showNormal()
+            if restore_geometry is not None:
+                top_level.restoreGeometry(restore_geometry)
+            if restore_state is not None and (
+                restore_state & Qt.WindowState.WindowMaximized
+            ):
+                top_level.showMaximized()
+            self._fullscreen_btn.setToolTip("切换应用全屏显示；可与精简模式同时启用")
+        self._log.setFocus()
+
+    def _update_mode_input_ui(self, mode: str) -> None:
+        unix_terminal = mode == "unix"
+        self._input_stack.setVisible(not unix_terminal)
+        self._input_stack.setCurrentIndex(1 if mode == "plain" else 0)
+        self._input_title.setText("输入设置" if unix_terminal else "发送")
+        self._unix_input_hint.setVisible(unix_terminal)
+        for button in self._unix_quick_buttons.values():
+            button.setVisible(unix_terminal)
+        self._timestamp_check.setEnabled(not unix_terminal)
+        self._hex_check.setEnabled(not unix_terminal)
+
+    def _focus_mode_input(self) -> None:
+        mode = self._current_mode()
+        if mode == "unix":
+            self._log.setFocus()
+        elif mode == "plain":
+            self._plain_input.setFocus()
+        else:
+            self._terminal_input.setFocus()
 
     def _current_mode(self) -> str:
         return str(self._mode_combo.currentData() or "terminal")
@@ -1239,10 +1395,6 @@ class TerminalWidget(QWidget):
             self._remember_send_history(text)
 
     def _send_text(self, text: str) -> bool:
-        session = self._active_session()
-        if session is None or session.serial_thread is None:
-            self._append_sys("发送失败：串口未连接")
-            return False
         encoding = self._current_encoding()
         try:
             data = text.encode(encoding)
@@ -1251,6 +1403,15 @@ class TerminalWidget(QWidget):
             return False
         except UnicodeEncodeError as exc:
             self._append_sys(f"发送失败：文本无法用 {encoding} 编码：{exc}")
+            return False
+        return self._send_bytes(data)
+
+    def _send_bytes(self, data: bytes) -> bool:
+        if not data:
+            return True
+        session = self._active_session()
+        if session is None or session.serial_thread is None:
+            self._append_sys("发送失败：串口未连接")
             return False
         session.serial_thread.send(data)
         self._append_record("TX", data)
@@ -1271,7 +1432,16 @@ class TerminalWidget(QWidget):
 
     def eventFilter(self, source, event) -> bool:
         if source is self._log and event.type() == QEvent.Type.KeyPress:
-            return self._handle_terminal_log_key(event)
+            return self._handle_unix_terminal_key(event)
+        if (
+            source is self._log
+            and event.type() == QEvent.Type.InputMethod
+            and self._current_mode() == "unix"
+        ):
+            commit_text = event.commitString()
+            if commit_text:
+                self._send_text(commit_text)
+            return True
 
         if event.type() == QEvent.Type.KeyPress and source in (
             self._terminal_input,
@@ -1287,53 +1457,58 @@ class TerminalWidget(QWidget):
                 return self._navigate_send_history(source, 1)
         return super().eventFilter(source, event)
 
-    def _handle_terminal_log_key(self, event) -> bool:
-        if self._current_mode() != "terminal":
+    def _handle_unix_terminal_key(self, event) -> bool:
+        if self._current_mode() != "unix":
             return False
-        if event.modifiers() & (
-            Qt.KeyboardModifier.ControlModifier
-            | Qt.KeyboardModifier.AltModifier
-            | Qt.KeyboardModifier.MetaModifier
-        ):
-            return False
-
         key = event.key()
-        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            text = self._terminal_inline_input
-            if self._send_text(text + self._current_newline()):
-                self._remember_send_history(text)
-                self._terminal_inline_input = ""
-                self._save_active_session_properties()
-                self._schedule_render()
+        modifiers = event.modifiers()
+        control = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+        shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+        if control and shift and key == Qt.Key.Key_C:
+            self._log.copy()
             return True
-        if key == Qt.Key.Key_Backspace:
-            self._terminal_inline_input = self._terminal_inline_input[:-1]
-            self._save_active_session_properties()
-            self._schedule_render()
+        if (control and key == Qt.Key.Key_V) or (
+            shift and key == Qt.Key.Key_Insert
+        ):
+            self._paste_unix_terminal()
             return True
-        if key == Qt.Key.Key_Escape:
-            self._terminal_inline_input = ""
-            self._save_active_session_properties()
-            self._schedule_render()
-            return True
-        if key == Qt.Key.Key_Up and self._can_use_history(self._log, previous=True):
-            return self._navigate_send_history(self._log, -1)
-        if key == Qt.Key.Key_Down and self._can_use_history(self._log, previous=False):
-            return self._navigate_send_history(self._log, 1)
 
-        text = event.text()
-        if text and text >= " ":
-            self._terminal_inline_input += text
-            self._save_active_session_properties()
-            self._schedule_render()
+        encoding = self._current_encoding()
+        try:
+            data = encode_unix_key(
+                key,
+                event.text(),
+                modifiers,
+                encoding,
+                self._current_newline(),
+            )
+        except LookupError:
+            self._append_sys(f"发送失败：未知编码 {encoding}")
             return True
-        return False
+        except UnicodeEncodeError as exc:
+            self._append_sys(f"发送失败：文本无法用 {encoding} 编码：{exc}")
+            return True
+        if data is None:
+            return False
+        self._send_bytes(data)
+        return True
+
+    def _paste_unix_terminal(self) -> None:
+        text = QApplication.clipboard().text()
+        if not text:
+            return
+        self._send_text(normalize_pasted_text(text, self._current_newline()))
+        self._log.setFocus()
+
+    def _send_unix_quick_bytes(self, data: bytes) -> None:
+        self._send_bytes(data)
+        self._log.setFocus()
 
     def _can_use_history(self, source: QWidget, previous: bool) -> bool:
         if source is self._terminal_input:
             return True
         if source is self._log:
-            return self._current_mode() == "terminal"
+            return False
         if source is self._plain_input:
             cursor = self._plain_input.textCursor()
             block = cursor.blockNumber()
@@ -1365,8 +1540,6 @@ class TerminalWidget(QWidget):
     def _input_text(self, source: QWidget) -> str:
         if source is self._terminal_input:
             return self._terminal_input.toPlainText()
-        if source is self._log:
-            return self._terminal_inline_input
         if source is self._plain_input:
             return self._plain_input.toPlainText()
         return ""
@@ -1377,11 +1550,6 @@ class TerminalWidget(QWidget):
             cursor = self._terminal_input.textCursor()
             cursor.movePosition(QTextCursor.MoveOperation.End)
             self._terminal_input.setTextCursor(cursor)
-            return
-        if source is self._log:
-            self._terminal_inline_input = text
-            self._save_active_session_properties()
-            self._schedule_render()
             return
         if source is self._plain_input:
             self._plain_input.setPlainText(text)
@@ -1503,6 +1671,23 @@ class TerminalWidget(QWidget):
 
     def _build_display_text(self) -> tuple[str, bool]:
         mode = self._current_mode()
+        if mode == "unix":
+            session = self._active_session()
+            if session is None:
+                return self._build_html_page(""), True
+            session.unix_terminal.sync(
+                (
+                    (record.record_id, record.payload)
+                    for record in self._records
+                    if record.direction == "RX"
+                ),
+                self._current_encoding(),
+            )
+            return (
+                self._build_html_page(session.unix_terminal.render_html()),
+                True,
+            )
+
         timestamp_enabled = self._timestamp_check.isChecked()
         hex_enabled = self._hex_check.isChecked()
         encoding = self._current_encoding()
@@ -1516,8 +1701,6 @@ class TerminalWidget(QWidget):
                     parts.append(decoded_payloads.get(record.record_id, ""))
                 elif record.direction == "SYS":
                     parts.append(f"\n[SYS] {record.message}\n")
-            if self._terminal_inline_input:
-                parts.append(self._terminal_inline_input)
             return self._build_html_page(self._colorize_html_text("".join(parts))), True
 
         if timestamp_enabled:
@@ -1531,9 +1714,6 @@ class TerminalWidget(QWidget):
                 )
                 if formatted:
                     lines.append(formatted)
-            if mode == "terminal" and self._terminal_inline_input:
-                label = self._format_html_label("[INPUT]", "#93c5fd")
-                lines.append(f"{label} {self._colorize_html_text(self._terminal_inline_input)}")
             return self._build_html_page("\n".join(lines)), True
 
         lines: list[str] = []
@@ -1546,8 +1726,6 @@ class TerminalWidget(QWidget):
             )
             if formatted:
                 lines.append(formatted)
-        if mode == "terminal" and self._terminal_inline_input:
-            lines.append(f"[INPUT] {self._terminal_inline_input}")
         return self._build_html_page(self._colorize_html_text("\n".join(lines))), True
 
     def _format_record_plain(

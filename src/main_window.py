@@ -93,6 +93,55 @@ from .terminal_widget import TerminalWidget
 from .verify_widget import VerifyWidget
 
 
+JUMP_LIST_TASKS: tuple[tuple[str, str], ...] = (
+    ("烧录", "--tab 0"),
+    ("合成", "--tab 3"),
+    ("终端 - 标准终端", "--tab 4 --terminal-mode terminal"),
+    ("终端 - Unix 终端", "--tab 4 --terminal-mode unix"),
+)
+
+
+def terminal_mode_from_argv(argv: list[str]) -> str | None:
+    """Return a validated terminal type requested by a Jump List launch."""
+
+    try:
+        value = argv[argv.index("--terminal-mode") + 1]
+    except (ValueError, IndexError):
+        return None
+    return value if value in {"terminal", "unix", "plain"} else None
+
+
+def is_bluetooth_serial_port(port_info) -> bool:
+    """Return whether a Windows serial entry is a Bluetooth virtual COM port."""
+
+    description = str(getattr(port_info, "description", "") or "")
+    metadata = " ".join(
+        str(getattr(port_info, field, "") or "")
+        for field in ("hwid", "location", "interface", "product")
+    )
+    if re.search(r"\bBTH(?:ENUM|MODEM)\b", metadata, re.IGNORECASE):
+        return True
+    return bool(
+        re.search(r"蓝牙.*标准串行|标准串行.*蓝牙", description, re.IGNORECASE)
+        or re.search(
+            r"standard\s+serial.*bluetooth|bluetooth.*standard\s+serial",
+            description,
+            re.IGNORECASE,
+        )
+        or re.search(r"bluetooth[-\s]+(?:incoming|outgoing)[-\s]+port", description, re.IGNORECASE)
+    )
+
+
+def is_default_hidden_serial_port(port_info) -> bool:
+    """Return whether the flash workbench should hide a port by default."""
+
+    description = str(getattr(port_info, "description", "") or "")
+    return bool(
+        re.search(r"通信端口|Communications Port", description, re.IGNORECASE)
+        or is_bluetooth_serial_port(port_info)
+    )
+
+
 class ReferenceNoticeDialog(QDialog):
     """Scrollable component/version notice with copyable offline details."""
 
@@ -398,6 +447,7 @@ class OtoolEsptoolUI(QMainWindow):
         # ── 顶部工具栏 ─────────────────────────────────────
         toolbar = QFrame()
         toolbar.setObjectName("toolbar")
+        self._toolbar = toolbar
         toolbar_layout = QVBoxLayout(toolbar)
         toolbar_layout.setContentsMargins(16, 10, 16, 10)
         toolbar_layout.setSpacing(8)
@@ -423,6 +473,12 @@ class OtoolEsptoolUI(QMainWindow):
         self.refresh_ports_button.clicked.connect(self.refresh_ports)
         self.clear_devices_button = QPushButton("清空设备")
         self.clear_devices_button.clicked.connect(self.clear_devices)
+        self.show_all_devices_button = QPushButton("显示全部")
+        self.show_all_devices_button.setCheckable(True)
+        self.show_all_devices_button.setToolTip(
+            "显示默认屏蔽的系统通信端口和蓝牙虚拟串口"
+        )
+        self.show_all_devices_button.toggled.connect(self._toggle_show_all_devices)
         self.auto_refresh_button = QPushButton("自动刷新: 关")
         self.auto_refresh_button.setCheckable(True)
         self.auto_refresh_button.toggled.connect(self.toggle_auto_refresh)
@@ -493,6 +549,7 @@ class OtoolEsptoolUI(QMainWindow):
         _fr2.addSpacing(4)
         _fr2.addWidget(self.refresh_ports_button)
         _fr2.addWidget(self.clear_devices_button)
+        _fr2.addWidget(self.show_all_devices_button)
         _fr2.addStretch(1)
         _fr2.addWidget(self.status_label)
 
@@ -610,7 +667,11 @@ class OtoolEsptoolUI(QMainWindow):
         page_terminal = QWidget()
         pg4_layout = QVBoxLayout(page_terminal)
         pg4_layout.setContentsMargins(0, 0, 0, 70)
+        self._terminal_page_layout = pg4_layout
         self._terminal_widget = TerminalWidget(port_registry=self._port_registry)
+        self._terminal_widget.compactModeChanged.connect(
+            self._set_terminal_compact_mode
+        )
         pg4_layout.addWidget(self._terminal_widget)
 
         self.page_stack.addWidget(page_flash)
@@ -710,6 +771,20 @@ class OtoolEsptoolUI(QMainWindow):
 
     def _position_floating_info_panel(self) -> None:
         self._position_floating_panels()
+
+    def _set_terminal_compact_mode(self, enabled: bool) -> None:
+        """Show only the serial terminal workbench while compact mode is active."""
+
+        self._toolbar.setVisible(not enabled)
+        self.floating_tab_panel.setVisible(not enabled)
+        self.floating_info_panel.setVisible(not enabled)
+        self._terminal_page_layout.setContentsMargins(
+            0, 0, 0, 0 if enabled else 70
+        )
+        if enabled:
+            self.page_stack.setCurrentIndex(4)
+        else:
+            self._position_floating_panels()
 
     _TAB_TITLES = ["烧录台", "熔丝台", "校验台", "分合台", "终端台"]
 
@@ -1264,17 +1339,22 @@ class OtoolEsptoolUI(QMainWindow):
     def refresh_ports(self) -> None:
         previous_ids = set(self.device_cards)
         ports = []
+        all_active_ids: set[str] = set()
+        default_hidden_count = 0
+        show_all = self.show_all_devices_button.isChecked()
         for port_info in list_ports.comports():
-            if port_info.description and re.search(
-                r"通信端口|Communications Port", port_info.description
-            ):
+            device_id = self._make_device_id(port_info)
+            all_active_ids.add(device_id)
+            default_hidden = is_default_hidden_serial_port(port_info)
+            if default_hidden:
+                default_hidden_count += 1
+            if default_hidden and not show_all:
                 continue
             label = (
                 port_info.description
                 if port_info.description and port_info.description != "n/a"
                 else "串口设备"
             )
-            device_id = self._make_device_id(port_info)
             previous = self.device_infos.get(device_id)
             device = DeviceInfo(
                 device_id=device_id,
@@ -1300,6 +1380,8 @@ class OtoolEsptoolUI(QMainWindow):
             if card is None:
                 continue
             if card.process is not None:
+                if device_id in all_active_ids:
+                    continue
                 disconnected = self.device_infos.get(
                     device_id,
                     DeviceInfo(
@@ -1378,11 +1460,25 @@ class OtoolEsptoolUI(QMainWindow):
         self._rebuild_device_grid()
         self._update_stats()
         self.device_count_label.setText(f"{len(self.device_cards)} 台")
-        self.status_label.setText(
+        hidden_note = (
+            f"，已屏蔽 {default_hidden_count} 个系统/蓝牙串口"
+            if default_hidden_count and not show_all
+            else ""
+        )
+        status = (
             "状态: 未发现可用设备"
             if not self.device_cards
             else f"状态: 已识别 {len(self.device_cards)} 台设备，新增 {len(set(self.device_cards) - previous_ids)} 台"
         )
+        self.status_label.setText(status + hidden_note)
+        if show_all:
+            self.show_all_devices_button.setToolTip(
+                f"正在显示全部串口，其中 {default_hidden_count} 个通常会被屏蔽"
+            )
+        else:
+            self.show_all_devices_button.setToolTip(
+                f"当前已屏蔽 {default_hidden_count} 个系统/蓝牙虚拟串口，点击显示全部"
+            )
 
     def _update_stats(self) -> None:
         total = len(self.device_cards)
@@ -1750,6 +1846,9 @@ class OtoolEsptoolUI(QMainWindow):
             self.refresh_ports()
         else:
             self.refresh_timer.stop()
+
+    def _toggle_show_all_devices(self, _enabled: bool) -> None:
+        self.refresh_ports()
 
     def toggle_auto_flash(self, enabled: bool) -> None:
         self.auto_flash_button.setText(f"自动烧录: {'开' if enabled else '关'}")
@@ -2325,13 +2424,17 @@ def main() -> int:
         except (ValueError, IndexError):
             pass
 
+    _terminal_mode = terminal_mode_from_argv(sys.argv)
+    if _terminal_mode is not None:
+        window._terminal_widget.set_mode(_terminal_mode)
+
     window.show()
 
     # Windows Jump List：向任务栏注册快捷任务（任务对应 --tab 参数切换页面）
     setup_jump_list(
         app_id="onexs.otool_esptool_ui",
         exe_path=sys.executable,
-        tasks=[("烧录", ""), ("合成", "--tab 3"), ("终端", "--tab 4")],
+        tasks=list(JUMP_LIST_TASKS),
         script_path=TOOL_DIR / "otool_esptool_ui.py",
         icon_path=None if _FROZEN else _ico_path,
     )
