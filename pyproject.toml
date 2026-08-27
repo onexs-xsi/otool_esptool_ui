@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "otool-esptool-ui"
-version = "0.6.2"
+version = "0.6.3"
 description = "PyQt6 GUI for mass-detecting and flashing ESP devices with esptool"
 readme = "README.md"
 requires-python = ">=3.10"

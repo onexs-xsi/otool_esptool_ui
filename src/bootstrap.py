@@ -15,6 +15,9 @@ from .constants import (
 )
 
 
+_QT_DLL_DIRECTORY_HANDLES: list[object] = []
+
+
 def frozen_esptool_dispatch() -> None:
     """When packaged as a onefile .exe, re-route esptool sub-process calls.
 
@@ -242,7 +245,7 @@ def configure_qt_dll_path() -> None:
         dll_dir = candidate["bin"]
         plugins_dir = candidate["plugins"]
         if os.path.isdir(dll_dir):
-            os.add_dll_directory(dll_dir)
+            _QT_DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(dll_dir))
             if os.path.isdir(plugins_dir):
                 os.environ.setdefault("QT_PLUGIN_PATH", plugins_dir)
                 os.environ.setdefault(
