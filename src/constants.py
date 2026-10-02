@@ -31,7 +31,7 @@ else:
 # ── 应用信息（单一来源：otool_esptool_ui.py）─────────────────────────────────
 
 _DEFAULT_TITLE = "OTool Esptool UI | byonexs."
-_DEFAULT_VERSION = "0.6.11"
+_DEFAULT_VERSION = "0.6.15"
 _DEFAULT_AUTHOR = "ONEXS"
 
 
@@ -102,7 +102,11 @@ def _resolve_packaged_avatar_path() -> Path:
 # ── esptool 后端检测 ─────────────────────────────────────────────────────────
 
 def _local_esptool_available() -> bool:
-    return LOCAL_ESPTOOL_DIR.exists()
+    """An uninitialized Git submodule directory is not an esptool backend."""
+    return all(
+        (LOCAL_ESPTOOL_DIR / tool / "__init__.py").is_file()
+        for tool in ("esptool", "espefuse", "espsecure")
+    )
 
 
 def _tool_module_available(tool: str) -> bool:

@@ -1,3 +1,4 @@
+import codecs
 import re
 
 from PyQt6.QtCore import QProcess, QRectF, QSize, Qt
@@ -217,6 +218,9 @@ class DeviceCard(QFrame):
         self._last_command: list = []
         self._last_command_meta: dict = {}
         self._auto_retry_count: int = 0
+        self._stop_requested = False
+        self._output_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self._operation_output = ""
         self.setObjectName("deviceCard")
         self.setProperty("cardState", "idle")
         self.setFrameShape(QFrame.Shape.NoFrame)
@@ -523,6 +527,8 @@ class DeviceCard(QFrame):
         if running:
             self._process_output_buffer = ""
             self._last_stage_log = ""
+            self._output_decoder.reset()
+            self._operation_output = ""
             self.progress_bar.setValue(0)
             self.progress_bar.setFormat(f"{text} 0%")
 
@@ -565,9 +571,11 @@ class DeviceCard(QFrame):
 
     def set_newly_detected(self, is_new: bool) -> None:
         self.new_badge.setVisible(is_new)
-        if is_new:
+        previous = self.property("cardState")
+        if is_new and previous == "idle":
             self.setProperty("cardState", "new")
-        elif self.property("cardState") == "new":
+        elif not is_new and previous == "new":
             self.setProperty("cardState", "idle")
-        self.style().unpolish(self)
-        self.style().polish(self)
+        if previous != self.property("cardState"):
+            self.style().unpolish(self)
+            self.style().polish(self)

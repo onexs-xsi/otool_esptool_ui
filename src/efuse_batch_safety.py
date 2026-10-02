@@ -56,7 +56,7 @@ def _parse_numeric_efuse_value(value: object) -> int | None:
     normalized = str(value).strip().lower()
     if normalized in ("true", "enable", "enabled"):
         return 1
-    if normalized in ("false", "disable", "disabled", "none", ""):
+    if normalized in ("false", "disable", "disabled"):
         return 0
     if re.fullmatch(r"(?:[0-9a-f]{2}[:.\-\s]){5,7}[0-9a-f]{2}", normalized):
         normalized = re.sub(r"[:.\-\s]", "", normalized)
@@ -97,6 +97,16 @@ def _values_equal(
     target_field: EfuseTarget,
     info: Mapping[str, object],
 ) -> tuple[bool, tuple[int, int] | None]:
+    # Missing/null output is unknown, not an erased fuse.  In particular,
+    # never let the display-value fallback turn an unknown value into zero.
+    if not target_field.value.strip() or target_field.value.strip().lower() == "none":
+        return False, None
+    if "raw_value" not in info and (
+        info.get("value") is None
+        or not str(info["value"]).strip()
+        or str(info["value"]).strip().lower() == "none"
+    ):
+        return False, None
     if (
         "raw_value" in info
         and _parse_numeric_efuse_value(info.get("raw_value")) is None
@@ -105,6 +115,14 @@ def _values_equal(
     typed = _typed_values(target_field, info)
     if typed is not None:
         return typed[0] == typed[1], typed
+    # Both numeric sides being present means typed conversion failed its
+    # range check.  Matching display text cannot override invalid raw bits.
+    if (
+        _parse_numeric_efuse_value(info.get("raw_value", info.get("value")))
+        is not None
+        and _parse_numeric_efuse_value(target_field.value) is not None
+    ):
+        return False, None
     current = normalize_efuse_value(str(info.get("value", "")))
     target = normalize_efuse_value(target_field.value)
     return current == target, None
@@ -129,12 +147,12 @@ def evaluate_efuse_precheck(
             continue
 
         # A hidden value cannot prove either satisfaction or OTP compatibility.
-        if not bool(info.get("readable", True)):
+        if info.get("readable", True) is not True:
             conflicts.append(target_field.name)
             continue
 
         equal, typed = _values_equal(target_field, info)
-        if not bool(info.get("writeable", True)):
+        if info.get("writeable", True) is not True:
             if equal:
                 skipped.append(target_field.name)
             else:
@@ -184,7 +202,7 @@ def evaluate_efuse_verification(
             mismatches.append(target_field.name)
             continue
 
-        if not bool(info.get("readable", True)):
+        if info.get("readable", True) is not True:
             mismatches.append(target_field.name)
             continue
         equal, _typed = _values_equal(target_field, info)
@@ -236,6 +254,8 @@ def extract_stable_device_identity(
         if item is None:
             continue
         original_name, info = item
+        if info.get("readable", True) is not True:
+            continue
         if "raw_value" in info and str(info["raw_value"]).strip():
             compact_value = _normalize_device_identity(info["raw_value"])
         else:

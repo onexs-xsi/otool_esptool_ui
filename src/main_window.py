@@ -65,7 +65,6 @@ from .constants import (
     _FROZEN,
     _build_tool_command,
     _build_tool_worker_command,
-    decode_process_output,
     _inject_local_esptool_pythonpath,
     _local_esptool_available,
     _resolve_build_timestamp_text,
@@ -77,7 +76,7 @@ from .device_card import DeviceCard
 from .efuse_batch_dialog import BurnEfuseBatchWidget
 from .jump_list import setup_jump_list
 from .efuse_dialog import EFuseDialog
-from .esptool_commands import build_erase_flash_args, is_erase_flash_command
+from .esptool_commands import build_erase_flash_args, is_erase_flash_command, validate_flash_entries
 from .export_dialog import ExportFlashDialog
 from .flow_layout import FlowLayout
 from .helpers import _build_avatar_icon, _build_github_icon, _fetch_remote_avatar_bytes
@@ -149,8 +148,9 @@ class ReferenceNoticeDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(f"引用说明 - {APP_TITLE}")
         self.setModal(True)
-        self.setMinimumSize(900, 560)
-        self.resize(1120, 720)
+        self.setMinimumSize(600, 320)
+        available = self.screen().availableGeometry().size() - QSize(24, 48)
+        self.resize(QSize(1120, 720).boundedTo(available))
 
         build_time = _resolve_build_timestamp_text()
         self._plain_text = build_reference_notice_text(
@@ -414,6 +414,8 @@ class FlashEntryRow(QWidget):
 
 
 class OtoolEsptoolUI(QMainWindow):
+    _avatar_ready = pyqtSignal(bytes)
+
     def __init__(self) -> None:
         super().__init__()
         self.device_cards: dict[str, DeviceCard] = {}
@@ -422,6 +424,8 @@ class OtoolEsptoolUI(QMainWindow):
         self.acknowledged_device_ids: set[str] = set()
         self._port_registry = PortOwnershipRegistry()
         self._device_port_leases: dict[str, PortLease] = {}
+        self._pending_retries: dict[str, QTimer] = {}
+        self._auto_flash_generation = 0
         self.refresh_timer = QTimer(self)
         self.refresh_timer.setInterval(2500)
         self.refresh_timer.timeout.connect(self.refresh_ports)
@@ -644,19 +648,19 @@ class OtoolEsptoolUI(QMainWindow):
         # 页 1 — 熔丝台
         page_efuse = QWidget()
         pg1_layout = QVBoxLayout(page_efuse)
-        pg1_layout.setContentsMargins(0, 0, 0, 70)  # 底部留出浮动 tab 栏空间
+        pg1_layout.setContentsMargins(0, 0, 0, 0)
         pg1_layout.addWidget(self._efuse_batch_widget)
 
-        # 页 2 — 校验台（暂空白）
+        # 页 2 — 校验台
         page_verify = QWidget()
         pg2_layout = QVBoxLayout(page_verify)
-        pg2_layout.setContentsMargins(0, 0, 0, 70)
+        pg2_layout.setContentsMargins(0, 0, 0, 0)
         pg2_layout.addWidget(self._verify_widget)
 
         # 页 3 — 分合台
         page_merge_split = QWidget()
         pg3_layout = QVBoxLayout(page_merge_split)
-        pg3_layout.setContentsMargins(0, 0, 0, 70)
+        pg3_layout.setContentsMargins(0, 0, 0, 0)
         self._merge_split_widget = MergeSplitWidget(port_registry=self._port_registry)
         self._merge_split_widget.send_to_flash_station.connect(
             self._receive_merged_firmware
@@ -666,7 +670,7 @@ class OtoolEsptoolUI(QMainWindow):
         # 页 4 — 终端台
         page_terminal = QWidget()
         pg4_layout = QVBoxLayout(page_terminal)
-        pg4_layout.setContentsMargins(0, 0, 0, 70)
+        pg4_layout.setContentsMargins(0, 0, 0, 0)
         self._terminal_page_layout = pg4_layout
         self._terminal_widget = TerminalWidget(port_registry=self._port_registry)
         self._terminal_widget.compactModeChanged.connect(
@@ -682,9 +686,25 @@ class OtoolEsptoolUI(QMainWindow):
 
         root_layout.addWidget(toolbar)
         root_layout.addWidget(self.page_stack, 1)
-        self.setCentralWidget(central)
-        self._init_floating_info_panel(central)
-        self._init_floating_tab_panel(central)
+        # Keep every control reachable on small/high-DPI desktops. The content
+        # retains its natural minimum size inside a scrollable viewport; the
+        # workbench switcher stays outside it, so horizontal scrolling cannot
+        # hide navigation. At normal sizes the scrollbar disappears.
+        shell = QWidget()
+        shell_layout = QVBoxLayout(shell)
+        shell_layout.setContentsMargins(0, 0, 0, 0)
+        shell_layout.setSpacing(0)
+        self._content_scroll = QScrollArea()
+        self._content_scroll.setWidgetResizable(True)
+        self._content_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._content_scroll.setWidget(central)
+        shell_layout.addWidget(self._content_scroll, 1)
+        self._footer = QWidget()
+        self._footer.setFixedHeight(62)
+        shell_layout.addWidget(self._footer)
+        self.setCentralWidget(shell)
+        self._init_floating_info_panel(self._footer)
+        self._init_floating_tab_panel(self._footer)
         self._position_floating_panels()
         self._add_flash_entry()  # 初始化第一条烧录条目
 
@@ -717,10 +737,9 @@ class OtoolEsptoolUI(QMainWindow):
         self.github_button.setIconSize(QSize(20, 20))
         self.github_button.setMinimumWidth(74)
         self.github_button.clicked.connect(self.open_github_url)
-        # 异步下载网络头像，下载成功后替换按钮图标
-        _fetch_remote_avatar_bytes(
-            lambda data: QTimer.singleShot(0, lambda: self._update_github_icon(data))
-        )
+        # A queued Qt signal marshals the Python download thread to the GUI.
+        self._avatar_ready.connect(self._update_github_icon)
+        _fetch_remote_avatar_bytes(self._avatar_ready.emit)
 
         panel_layout.addWidget(self.version_badge)
         panel_layout.addWidget(self.author_badge)
@@ -753,7 +772,7 @@ class OtoolEsptoolUI(QMainWindow):
             return
         margin = 18
         panel_h = 44
-        y = max(margin, central.height() - panel_h - margin)
+        y = 0
 
         if hasattr(self, "floating_info_panel"):
             ps = self.floating_info_panel.sizeHint()
@@ -768,6 +787,14 @@ class OtoolEsptoolUI(QMainWindow):
             self.floating_tab_panel.setFixedHeight(panel_h)
             self.floating_tab_panel.move(margin, y)
             self.floating_tab_panel.raise_()
+        if hasattr(self, "floating_info_panel") and hasattr(self, "floating_tab_panel"):
+            stacked = (
+                self.floating_tab_panel.width() + self.floating_info_panel.width()
+                + 3 * margin > central.width()
+            )
+            self._footer.setFixedHeight(112 if stacked else 62)
+            if stacked:
+                self.floating_info_panel.move(margin, 50)
 
     def _position_floating_info_panel(self) -> None:
         self._position_floating_panels()
@@ -778,9 +805,7 @@ class OtoolEsptoolUI(QMainWindow):
         self._toolbar.setVisible(not enabled)
         self.floating_tab_panel.setVisible(not enabled)
         self.floating_info_panel.setVisible(not enabled)
-        self._terminal_page_layout.setContentsMargins(
-            0, 0, 0, 0 if enabled else 70
-        )
+        self._footer.setVisible(not enabled)
         if enabled:
             self.page_stack.setCurrentIndex(4)
         else:
@@ -815,7 +840,8 @@ class OtoolEsptoolUI(QMainWindow):
             row.addr_edit.setText("0x0")
 
     def _apply_style(self) -> None:
-        _arrow_path = str(TOOL_DIR / "src" / "assets" / "chevron_down.svg").replace("\\", "/")
+        # __file__ points into the onefile bundle; TOOL_DIR is the user's EXE directory.
+        _arrow_path = (Path(__file__).resolve().parent / "assets" / "chevron_down.svg").as_posix()
         self.setStyleSheet(
             BASE_STYLESHEET
             + """
@@ -1337,12 +1363,17 @@ class OtoolEsptoolUI(QMainWindow):
         self._sync_new_badge(device_id)
 
     def refresh_ports(self) -> None:
+        try:
+            enumerated_ports = list(list_ports.comports())
+        except Exception as exc:
+            self.status_label.setText(f"状态: 串口扫描失败：{exc}")
+            return
         previous_ids = set(self.device_cards)
         ports = []
         all_active_ids: set[str] = set()
         default_hidden_count = 0
         show_all = self.show_all_devices_button.isChecked()
-        for port_info in list_ports.comports():
+        for port_info in enumerated_ports:
             device_id = self._make_device_id(port_info)
             all_active_ids.add(device_id)
             default_hidden = is_default_hidden_serial_port(port_info)
@@ -1393,6 +1424,7 @@ class OtoolEsptoolUI(QMainWindow):
                 card.update_device(disconnected)
                 card.set_result_state("设备已断开", "disconnected")
             else:
+                self._cancel_retry(device_id)
                 self.device_cards.pop(device_id, None)
                 self.device_infos.pop(device_id, None)
                 card.setParent(None)
@@ -1403,8 +1435,6 @@ class OtoolEsptoolUI(QMainWindow):
             if device.device_id in self.device_cards:
                 self.device_cards[device.device_id].update_device(device)
                 self._sync_new_badge(device.device_id)
-                if self.device_cards[device.device_id].process is None:
-                    self.device_cards[device.device_id].set_result_state("空闲", "idle")
             else:
                 card = DeviceCard(device)
                 card.erase_button.clicked.connect(
@@ -1452,8 +1482,9 @@ class OtoolEsptoolUI(QMainWindow):
                 if self.auto_flash_button.isChecked():
                     QTimer.singleShot(
                         100,
-                        lambda device_id=device.device_id: self._auto_flash_new_device(
-                            device_id
+                        lambda device_id=device.device_id, expected_card=card,
+                        generation=self._auto_flash_generation: self._auto_flash_new_device(
+                            device_id, expected_card, generation
                         ),
                     )
 
@@ -1483,7 +1514,8 @@ class OtoolEsptoolUI(QMainWindow):
     def _update_stats(self) -> None:
         total = len(self.device_cards)
         running = sum(
-            1 for card in self.device_cards.values() if card.process is not None
+            1 for did, card in self.device_cards.items()
+            if card.process is not None or did in self._pending_retries
         )
         success = sum(
             1
@@ -1505,16 +1537,16 @@ class OtoolEsptoolUI(QMainWindow):
             self.device_cards.values(),
             key=lambda card: self._port_sort_key(card.device.port),
         )
-        while self.device_layout.count() > 0:
-            item = self.device_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.setParent(None)
-        if not cards:
-            self.device_layout.addWidget(self.empty_hint)
+        desired = cards or [self.empty_hint]
+        if [self.device_layout.itemAt(i).widget()
+                for i in range(self.device_layout.count())] == desired:
             return
-        for card in cards:
-            self.device_layout.addWidget(card)
+        while self.device_layout.count() > 0:
+            self.device_layout.takeAt(0)
+        self.empty_hint.setVisible(not cards)
+        for widget in desired:
+            self.device_layout.addWidget(widget)
+            widget.show()
 
     def _port_sort_key(self, port: str) -> tuple[int, str]:
         match = re.search(r"(\d+)$", port)
@@ -1530,11 +1562,11 @@ class OtoolEsptoolUI(QMainWindow):
         hwid = getattr(port_info, "hwid", "") or ""
         description = getattr(port_info, "description", "") or ""
         if serial_number:
-            return f"sn:{serial_number}"
+            return f"sn:{serial_number}:port:{port_info.device}"
         if location and vid is not None and pid is not None:
-            return f"loc:{vid:04x}:{pid:04x}:{location}"
-        if hwid:
-            return f"hwid:{hwid}"
+            return f"loc:{vid:04x}:{pid:04x}:{location}:port:{port_info.device}"
+        if hwid and hwid.lower() != "n/a":
+            return f"hwid:{hwid}:port:{port_info.device}"
         return f"port:{port_info.device}:{description}"
 
     def _extract_with_patterns(self, text: str, patterns: list[str]) -> str:
@@ -1572,27 +1604,13 @@ class OtoolEsptoolUI(QMainWindow):
         校验所有烧录条目并返回 [(addr, path), ...]；任一条目不合法则弹窗并返回 None。
         空行（地址和路径均为空）直接跳过。
         """
-        entries: list[tuple[str, str]] = []
-        for row in self._flash_rows:
-            addr = row.addr_edit.text().strip()
-            path = row.path_edit.text().strip()
-            if not addr and not path:
-                continue
-            if not addr or not re.match(r'^0[xX][0-9a-fA-F]+$', addr):
-                QMessageBox.warning(
-                    self,
-                    "提示",
-                    f"烧录地址格式不正确：{addr!r}，应为十六进制如 0x0、0x10000。",
-                )
-                return None
-            if not path or not Path(path).is_file():
-                QMessageBox.warning(self, "提示", f"请选择有效的固件文件（当前：{path!r}）。")
-                return None
-            entries.append((addr, path))
-        if not entries:
-            QMessageBox.warning(self, "提示", "请至少填写一个有效的烧录条目。")
+        try:
+            return validate_flash_entries([
+                (row.addr_edit.text(), row.path_edit.text()) for row in self._flash_rows
+            ])
+        except ValueError as exc:
+            QMessageBox.warning(self, "提示", str(exc))
             return None
-        return entries
 
     def _validate_common_inputs(self, require_bin: bool) -> bool:
         if not _tool_backend_available("esptool"):
@@ -1603,8 +1621,8 @@ class OtoolEsptoolUI(QMainWindow):
             )
             return False
         baud_text = self.baud_edit.currentText().strip()
-        if not baud_text.isdigit():
-            QMessageBox.warning(self, "提示", "公共波特率必须是数字。")
+        if not re.fullmatch(r"[0-9]+", baud_text) or not 0 < int(baud_text) <= 0x7FFFFFFF:
+            QMessageBox.warning(self, "提示", "公共波特率必须是有效的正整数。")
             return False
         if require_bin:
             return self._get_valid_flash_entries() is not None
@@ -1625,7 +1643,7 @@ class OtoolEsptoolUI(QMainWindow):
 
     def _handle_device_action(self, device_id: str, action: str) -> None:
         card = self.device_cards.get(device_id)
-        if card is not None and card.process is not None:
+        if card is not None and (card.process is not None or device_id in self._pending_retries):
             self.stop_process(device_id)
             return
         if action == "erase":
@@ -1649,16 +1667,13 @@ class OtoolEsptoolUI(QMainWindow):
         return value
 
     def reset_device(self, device_id: str, acknowledge: bool = True) -> None:
-        if not _tool_backend_available("esptool"):
-            QMessageBox.critical(self, "错误", "未找到可用 esptool。")
+        card = self.device_cards.get(device_id)
+        if card is None or not card.device.connected:
             return
-        baud_text = self.baud_edit.currentText().strip()
-        if not baud_text.isdigit():
-            QMessageBox.warning(self, "提示", "公共波特率必须是数字。")
+        if not self._validate_common_inputs(require_bin=False):
             return
         if acknowledge:
             self._acknowledge_device(device_id)
-        card = self.device_cards[device_id]
         esptool_args = self._build_esptool_base_args(device_id) + ["run"]
         self._start_process(
             card,
@@ -1672,13 +1687,9 @@ class OtoolEsptoolUI(QMainWindow):
         )
 
     def export_firmware(self, device_id: str, acknowledge: bool = True) -> None:
-        if not _tool_backend_available("esptool"):
-            QMessageBox.critical(self, "错误", "未找到可用 esptool。")
+        if not self._validate_common_inputs(require_bin=False):
             return
         baud_text = self.baud_edit.currentText().strip()
-        if not baud_text.isdigit():
-            QMessageBox.warning(self, "提示", "公共波特率必须是数字。")
-            return
         info = self.device_infos.get(device_id)
         card = self.device_cards.get(device_id)
         if info is None or card is None:
@@ -1728,11 +1739,13 @@ class OtoolEsptoolUI(QMainWindow):
         )
 
     def erase_flash(self, device_id: str, acknowledge: bool = True) -> None:
+        card = self.device_cards.get(device_id)
+        if card is None or not card.device.connected:
+            return
         if not self._validate_common_inputs(require_bin=False):
             return
         if acknowledge:
             self._acknowledge_device(device_id)
-        card = self.device_cards[device_id]
         esptool_args = build_erase_flash_args(
             self._build_esptool_base_args(device_id)
         )
@@ -1748,19 +1761,16 @@ class OtoolEsptoolUI(QMainWindow):
         )
 
     def flash_firmware(self, device_id: str, acknowledge: bool = True) -> None:
+        card = self.device_cards.get(device_id)
+        if card is None or not card.device.connected:
+            return
+        if not self._validate_common_inputs(require_bin=False):
+            return
         entries = self._get_valid_flash_entries()
         if entries is None:
             return
-        if not _tool_backend_available("esptool"):
-            QMessageBox.critical(self, "错误", "未找到可用 esptool。")
-            return
-        baud_text = self.baud_edit.currentText().strip()
-        if not baud_text.isdigit():
-            QMessageBox.warning(self, "提示", "公共波特率必须是数字。")
-            return
         if acknowledge:
             self._acknowledge_device(device_id)
-        card = self.device_cards[device_id]
         flash_pairs: list[str] = []
         for addr, path in entries:
             flash_pairs += [addr, path]
@@ -1776,7 +1786,10 @@ class OtoolEsptoolUI(QMainWindow):
             backend_text="内置 esptool API worker",
         )
 
-    def _auto_flash_new_device(self, device_id: str) -> None:
+    def _auto_flash_new_device(
+        self, device_id: str, expected_card: DeviceCard | None = None,
+        generation: int | None = None,
+    ) -> None:
         card = self.device_cards.get(device_id)
         info = self.device_infos.get(device_id)
         if (
@@ -1784,6 +1797,12 @@ class OtoolEsptoolUI(QMainWindow):
             or info is None
             or not info.connected
             or card.process is not None
+            or card._stop_requested
+            or device_id not in self.new_device_ids
+            or device_id in self._pending_retries
+            or not self.auto_flash_button.isChecked()
+            or (expected_card is not None and card is not expected_card)
+            or (generation is not None and generation != self._auto_flash_generation)
         ):
             return
         if not self._validate_common_inputs(require_bin=True):
@@ -1795,7 +1814,7 @@ class OtoolEsptoolUI(QMainWindow):
             return
         for port, card in list(self.device_cards.items()):
             info = self.device_infos.get(port)
-            if card.process is None and (info is None or info.connected):
+            if card.process is None and port not in self._pending_retries and (info is None or info.connected):
                 self.erase_flash(port)
 
     def flash_all_devices(self) -> None:
@@ -1803,10 +1822,11 @@ class OtoolEsptoolUI(QMainWindow):
             return
         for port, card in list(self.device_cards.items()):
             info = self.device_infos.get(port)
-            if card.process is None and (info is None or info.connected):
+            if card.process is None and port not in self._pending_retries and (info is None or info.connected):
                 self.flash_firmware(port)
 
     def stop_all_devices(self) -> bool:
+        self._auto_flash_generation += 1
         stopped = True
         for device_id in list(self.device_cards):
             stopped = self.stop_process(device_id) and stopped
@@ -1814,11 +1834,16 @@ class OtoolEsptoolUI(QMainWindow):
 
     def clear_devices(self) -> None:
         """移除所有设备卡片并重置 NEW 状态，下次刷新时所有设备重新判定为新设备。"""
+        self._auto_flash_generation += 1
         retained = 0
         for device_id, card in list(self.device_cards.items()):
+            self._cancel_retry(device_id)
             if card.process is not None:
-                card.process.kill()
-                if not card.process.waitForFinished(1500):
+                card._stop_requested = True
+                process = card.process
+                process.kill()
+                if (process.state() != QProcess.ProcessState.NotRunning
+                        and not process.waitForFinished(1500)):
                     card.append_log("停止超时，已保留设备卡片和串口所有权。")
                     card.set_result_state("停止超时", "error")
                     retained += 1
@@ -1851,6 +1876,7 @@ class OtoolEsptoolUI(QMainWindow):
         self.refresh_ports()
 
     def toggle_auto_flash(self, enabled: bool) -> None:
+        self._auto_flash_generation += 1
         self.auto_flash_button.setText(f"自动烧录: {'开' if enabled else '关'}")
 
     def _start_process(
@@ -1863,17 +1889,23 @@ class OtoolEsptoolUI(QMainWindow):
         backend_text: str | None = None,
         _is_retry: bool = False,
     ) -> None:
+        if self.device_cards.get(card.device.device_id) is not card or not card.device.connected:
+            return
         if card.process is not None:
             QMessageBox.information(
                 self, "提示", f"{card.device.port} 当前已有任务在运行。"
             )
             return
+        self._cancel_retry(card.device.device_id)
         lease = self._port_registry.acquire(
             card.device.port,
             owner=f"flash:{card.device.device_id}",
             purpose="烧录台任务",
         )
         if lease is None:
+            if _is_retry:
+                card.set_result_state("重试失败：串口被占用", "error")
+                self._update_stats()
             claim = self._port_registry.claim_for(card.device.port)
             detail = f"，当前用途：{claim.purpose}" if claim is not None else ""
             QMessageBox.information(
@@ -1885,6 +1917,7 @@ class OtoolEsptoolUI(QMainWindow):
         self._device_port_leases[card.device.device_id] = lease
         if not _is_retry:
             card._auto_retry_count = 0
+        card._stop_requested = False
         card._last_command = list(command)
         card._last_command_meta = {
             "busy_text": busy_text,
@@ -1914,15 +1947,15 @@ class OtoolEsptoolUI(QMainWindow):
         env.insert("PYTHONUTF8", "1")
         process.setProcessEnvironment(env)
         process.readyRead.connect(
-            lambda did=card.device.device_id: self._read_process_output(did)
+            lambda did=card.device.device_id, p=process: self._read_process_output(did, p)
         )
         process.finished.connect(
             lambda exit_code,
             exit_status,
-            did=card.device.device_id: self._process_finished(did, exit_code, exit_status)
+            did=card.device.device_id, p=process: self._process_finished(did, exit_code, exit_status, p)
         )
         process.errorOccurred.connect(
-            lambda error, did=card.device.device_id: self._process_error(did, error)
+            lambda error, did=card.device.device_id, p=process: self._process_error(did, error, p)
         )
         card.set_running_state(busy_text, True, active_action=active_action)
         initial_stage_text = ""
@@ -1939,20 +1972,25 @@ class OtoolEsptoolUI(QMainWindow):
             card.log_stage(initial_stage_text)
         self.status_label.setText(f"状态: {card.device.port} {busy_text}")
         card.append_log("[状态] 正在启动进程...")
+        process.started.connect(
+            lambda did=card.device.device_id, p=process: self._process_started(did, p)
+        )
+        self._update_stats()
         process.start()
-        if not process.waitForStarted(3000):
-            card.append_log("进程启动失败。")
-            card.set_running_state("启动失败", False)
-            self._cleanup_process(card.device.device_id)
-            return
-        card.append_log(f"[状态] 进程已启动，PID: {process.processId()}")
-        card.append_log("[状态] 等待工具输出...")
 
-    def _read_process_output(self, device_id: str) -> None:
+    def _process_started(self, device_id: str, process: QProcess) -> None:
+        card = self.device_cards.get(device_id)
+        if card is not None and card.process is process:
+            card.append_log(f"[状态] 进程已启动，PID: {process.processId()}")
+            card.append_log("[状态] 等待工具输出...")
+
+    def _read_process_output(self, device_id: str, expected_process: QProcess | None = None) -> None:
         card = self.device_cards.get(device_id)
         if card is None or card.process is None:
             return
-        data = decode_process_output(bytes(card.process.readAll()))
+        if expected_process is not None and card.process is not expected_process:
+            return
+        data = card._output_decoder.decode(bytes(card.process.readAll()))
         if data:
             self._handle_process_output_chunk(card, data)
 
@@ -1965,6 +2003,9 @@ class OtoolEsptoolUI(QMainWindow):
             self._handle_process_output_line(card, line)
 
     def _flush_process_output_buffer(self, card: DeviceCard) -> None:
+        tail = card._output_decoder.decode(b"", final=True)
+        if tail:
+            self._handle_process_output_chunk(card, tail)
         if card._process_output_buffer:
             remaining = card._process_output_buffer
             card._process_output_buffer = ""
@@ -1979,8 +2020,12 @@ class OtoolEsptoolUI(QMainWindow):
                 card.append_log(line)
                 self._update_progress_from_output(card, line)
                 return
-            self._handle_worker_event(card, event)
+            if isinstance(event, dict):
+                self._handle_worker_event(card, event)
+            else:
+                card.append_log(line)
             return
+        card._operation_output = (card._operation_output + line + "\n")[-262144:]
         card.append_log(line)
         self._update_progress_from_output(card, line)
 
@@ -1988,25 +2033,26 @@ class OtoolEsptoolUI(QMainWindow):
         event_type = str(event.get("type", ""))
         if event_type == "log":
             text = str(event.get("text", ""))
+            card._operation_output = (card._operation_output + text + "\n")[-262144:]
             card.append_log(text)
             self._update_progress_from_output(card, text)
             return
         if event_type == "progress":
-            total = int(event.get("total", 0) or 0)
-            current = int(event.get("current", 0) or 0)
-            percent = int(event.get("percent", 0) or 0)
+            try:
+                percent = max(0, min(100, int(event.get("percent", 0) or 0)))
+            except (ValueError, TypeError, OverflowError):
+                return
             prefix = str(event.get("prefix", "") or "执行中")
             suffix = str(event.get("suffix", "") or "")
             if "reading from" in prefix.lower():
                 prefix = "正在导出 Flash"
-            if total > 0:
-                percent = max(0, min(100, percent))
             progress_text = " ".join(part for part in [prefix.strip(), f"{percent}%", suffix.strip()] if part)
             card.set_progress(percent, progress_text)
             return
         if event_type == "fatal":
             text = str(event.get("text", ""))
             if text:
+                card._operation_output = (card._operation_output + text + "\n")[-262144:]
                 card.append_log(text)
             return
 
@@ -2070,15 +2116,20 @@ class OtoolEsptoolUI(QMainWindow):
                 card.set_stage_text(stage_text)
 
     def _process_finished(
-        self, device_id: str, exit_code: int, _exit_status: QProcess.ExitStatus
+        self, device_id: str, exit_code: int, _exit_status: QProcess.ExitStatus,
+        expected_process: QProcess | None = None,
     ) -> None:
         card = self.device_cards.get(device_id)
-        if card is None:
+        if card is None or card.process is None:
+            return
+        if expected_process is not None and card.process is not expected_process:
             return
         self._read_process_output(device_id)
         self._flush_process_output_buffer(card)
         card.append_log(f"[状态] 进程已结束，退出码: {exit_code}")
-        if exit_code == 0:
+        if card._stop_requested:
+            card.set_result_state("已停止", "error")
+        elif exit_code == 0 and _exit_status == QProcess.ExitStatus.NormalExit:
             card.append_log("任务完成。")
             success_text = (
                 "导出成功"
@@ -2096,25 +2147,40 @@ class OtoolEsptoolUI(QMainWindow):
         self.status_label.setText(f"状态: {card.device.port} 任务结束")
         self._cleanup_process(device_id)
 
-    def _process_error(self, device_id: str, error: QProcess.ProcessError) -> None:
+    def _process_error(
+        self, device_id: str, error: QProcess.ProcessError,
+        expected_process: QProcess | None = None,
+    ) -> None:
         card = self.device_cards.get(device_id)
-        if card is None:
+        if card is None or card.process is None:
+            return
+        if expected_process is not None and card.process is not expected_process:
             return
         card.append_log(f"[状态] 进程错误事件: {error}")
         card.append_log(f"进程错误: {error}")
-        card.set_result_state(f"进程错误({error})", "error")
-        self._update_stats()
         self.status_label.setText(f"状态: {card.device.port} 发生进程错误")
-        self._cleanup_process(device_id)
+        # Crashed emits finished next; I/O errors may leave the process alive.
+        # Keep its lease and stop button until its actual terminal event.
+        if error == QProcess.ProcessError.FailedToStart:
+            card.set_result_state("启动失败", "error")
+            self._cleanup_process(device_id)
 
     def stop_process(self, device_id: str) -> bool:
         card = self.device_cards.get(device_id)
+        if card is not None:
+            card._stop_requested = True
+        if self._cancel_retry(device_id) and card is not None:
+            card.set_result_state("已停止", "error")
+            self._update_stats()
         if card is None or card.process is None:
             return True
         self._acknowledge_device(device_id)
         card.append_log("用户请求停止任务。")
-        card.process.kill()
-        if not card.process.waitForFinished(1500):
+        card._stop_requested = True
+        process = card.process
+        process.kill()
+        if (process.state() != QProcess.ProcessState.NotRunning
+                and not process.waitForFinished(1500)):
             card.append_log("进程未在安全等待时间内结束，串口仍保持锁定。")
             card.set_result_state("停止超时", "error")
             self.status_label.setText(f"状态: {card.device.port} 停止超时")
@@ -2125,12 +2191,15 @@ class OtoolEsptoolUI(QMainWindow):
         self._cleanup_process(device_id)
         return True
 
-    def _open_efuse_dialog(self, device_id: str) -> None:
+    def _open_efuse_dialog(self, device_id: str, preset: tuple[str, str] | None = None) -> None:
         info = self.device_infos.get(device_id)
-        if info is None:
+        if info is None or not info.connected:
+            return
+        baud = self.baud_edit.currentText().strip()
+        if not re.fullmatch(r"[0-9]+", baud) or not 0 < int(baud) <= 0x7FFFFFFF:
+            QMessageBox.warning(self, "提示", "公共波特率必须是有效的正整数。")
             return
         self._acknowledge_device(device_id)
-        baud = self.baud_edit.currentText().strip() or "115200"
         lease = self._port_registry.acquire(
             info.port,
             owner=f"efuse-dialog:{device_id}",
@@ -2143,6 +2212,8 @@ class OtoolEsptoolUI(QMainWindow):
             return
         try:
             dlg = EFuseDialog(info, baud, parent=self)
+            if preset is not None:
+                dlg._apply_preset(*preset)
             dlg.exec()
         finally:
             lease.release()
@@ -2176,51 +2247,22 @@ class OtoolEsptoolUI(QMainWindow):
     def _burn_efuse_preset(
         self, device_id: str, efuse_name: str, value: str, label: str, description: str = ""
     ) -> None:
-        info = self.device_infos.get(device_id)
-        if info is None:
-            return
-        desc_html = f"<br><br>{description}" if description else ""
-        reply = QMessageBox.warning(
-            self,
-            "确认烧录 eFuse",
-            f"即将对设备 <b>{info.port}</b>（{info.chip_name}）烧录 eFuse："
-            f"<br><br><b>{efuse_name} = {value}</b>（{label}）"
-            f"{desc_html}"
-            f"<br><br>⚠️ eFuse 烧录不可逆，请确认后再操作。",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-        baud = self.baud_edit.currentText().strip() or "115200"
-        chip_arg = resolve_chip_arg(info.chip_name)
-        espefuse_args = [
-            "--chip", chip_arg,
-            "--port", info.port,
-            "--baud", baud,
-            "--do-not-confirm",
-            "burn-efuse",
-            efuse_name, value,
-        ]
-        card = self.device_cards.get(device_id)
-        if card is None:
-            return
-        self._start_process(
-            card,
-            _build_tool_worker_command("espefuse", *espefuse_args),
-            f"烧录中 ({efuse_name})",
-            active_action="flash",
-            display_command=subprocess.list2cmdline(
-                _build_tool_command("espefuse", *espefuse_args)
-            ),
-            backend_text="内置 espefuse API worker",
-        )
+        # Use the dialog's confirmation and irreversible-operation protection.
+        self._open_efuse_dialog(device_id, preset=(efuse_name, value))
+
+    def _cancel_retry(self, device_id: str) -> bool:
+        timer = self._pending_retries.pop(device_id, None)
+        if timer is None:
+            return False
+        timer.stop()
+        timer.deleteLater()
+        return True
 
     def _try_auto_retry(self, card: DeviceCard, device_id: str) -> bool:
         """检测芯片类型不匹配错误并自动重试，返回 True 表示已触发重试。"""
-        if card._auto_retry_count >= 1:
+        if card._auto_retry_count >= 1 or card._stop_requested or not card.device.connected:
             return False
-        log_text = card.log_edit.toPlainText()
+        log_text = card._operation_output
         chip_match = re.search(r"This chip is ([\w\-]+), not", log_text)
         if not chip_match:
             return False
@@ -2229,9 +2271,11 @@ class OtoolEsptoolUI(QMainWindow):
         except ValueError:
             return False
         actual_chip = chip_match.group(1).lower().replace("-", "")
+        if chip_idx + 1 >= len(card._last_command) or actual_chip == card._last_command[chip_idx + 1]:
+            return False
         new_cmd = list(card._last_command)
         new_cmd[chip_idx + 1] = actual_chip
-        meta = card._last_command_meta
+        meta = dict(card._last_command_meta)
         new_display = meta.get("display_command") or ""
         if new_display:
             new_display = re.sub(r"--chip\s+\S+", f"--chip {actual_chip}", new_display)
@@ -2248,9 +2292,18 @@ class OtoolEsptoolUI(QMainWindow):
             f"→ 切换 --chip {actual_chip} 后重新执行..."
         )
         self._cleanup_process(device_id)
-        QTimer.singleShot(
-            300,
-            lambda: self._start_process(
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        self._pending_retries[device_id] = timer
+
+        def retry() -> None:
+            if self._pending_retries.get(device_id) is not timer:
+                return
+            self._cancel_retry(device_id)
+            if self.device_cards.get(device_id) is not card or not card.device.connected:
+                self._update_stats()
+                return
+            self._start_process(
                 card,
                 new_cmd,
                 meta.get("busy_text", "重试中"),
@@ -2258,13 +2311,16 @@ class OtoolEsptoolUI(QMainWindow):
                 display_command=new_display or None,
                 backend_text=meta.get("backend_text"),
                 _is_retry=True,
-            ),
-        )
+            )
+
+        timer.timeout.connect(retry)
+        timer.start(300)
+        self._update_stats()
         return True
 
     def _update_device_info_from_log(self, card: DeviceCard, device_id: str) -> None:
         """重试成功后从日志文本中解析完整芯片信息并刷新卡片。"""
-        log_text = card.log_edit.toPlainText()
+        log_text = card._operation_output
         info = self.device_infos.get(device_id)
         if info is None:
             return
@@ -2326,11 +2382,15 @@ class OtoolEsptoolUI(QMainWindow):
             card.apply_scale(self._card_scale)
 
     def eventFilter(self, source, event):
-        if event.type() == QEvent.Type.Wheel:
+        if (event.type() == QEvent.Type.Wheel
+                and self.page_stack.currentIndex() == 0
+                and isinstance(source, QWidget)
+                and self.scroll_area.isAncestorOf(source)):
             if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
                 delta = event.angleDelta().y()
-                self._adjust_card_scale(0.05 if delta > 0 else -0.05)
-                return True
+                if delta:
+                    self._adjust_card_scale(0.05 if delta > 0 else -0.05)
+                    return True
         return super().eventFilter(source, event)
 
     def closeEvent(self, event) -> None:
@@ -2343,12 +2403,14 @@ class OtoolEsptoolUI(QMainWindow):
             )
             event.ignore()
             return
-        running = [c for c in self.device_cards.values() if c.process is not None]
+        running = [c for did, c in self.device_cards.items()
+                   if c.process is not None or did in self._pending_retries]
         background_count = (
             self._efuse_batch_widget.active_task_count()
             + self._verify_widget.active_task_count()
             + self._terminal_widget.active_connection_count()
             + int(self._merge_split_widget.has_active_device_read())
+            + int(self._merge_split_widget.has_active_merge())
         )
         total_active = len(running) + background_count
         if total_active:
@@ -2428,6 +2490,10 @@ def main() -> int:
     if _terminal_mode is not None:
         window._terminal_widget.set_mode(_terminal_mode)
 
+    screen = app.primaryScreen()
+    if screen is not None:
+        available = screen.availableGeometry().size() - QSize(24, 48)
+        window.resize(window.size().boundedTo(available))
     window.show()
 
     # Windows Jump List：向任务栏注册快捷任务（任务对应 --tab 参数切换页面）

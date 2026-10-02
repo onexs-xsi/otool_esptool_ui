@@ -24,9 +24,9 @@ class ReferenceComponentsTests(unittest.TestCase):
         self.assertTrue(all(item.version_source == "构建清单" for item in components))
 
         esptool = next(item for item in components if item.name == "esptool")
-        self.assertEqual(esptool.version, "5.3.1")
-        self.assertEqual(esptool.release_date, "2026-06-29")
-        self.assertIn("0d2dfefe", esptool.version_detail)
+        self.assertEqual(esptool.version, "5.4.0")
+        self.assertEqual(esptool.release_date, "2026-09-02")
+        self.assertIn("5ac7935e", esptool.version_detail)
 
     def test_unknown_runtime_version_does_not_reuse_baseline_date(self) -> None:
         components = resolve_reference_components(lambda _name: "99.0.0")
@@ -43,8 +43,8 @@ class ReferenceComponentsTests(unittest.TestCase):
         )
 
         self.assertIn("OTool v0.6.1", text)
-        self.assertIn("版本发布日期：2026-06-29", text)
-        self.assertIn("Git 标签 v5.3.1", text)
+        self.assertIn("版本发布日期：2026-09-02", text)
+        self.assertIn("Git 标签 v5.4.0", text)
         self.assertIn("许可证：GPL-2.0-or-later", text)
         self.assertIn("https://github.com/espressif/esptool", text)
 

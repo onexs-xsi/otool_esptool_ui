@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -82,13 +83,23 @@ class VerifyMatchResult:
 
 
 def _coerce_int(value: Any, field_name: str, minimum: int | None = None) -> int:
+    if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+        raise ValueError(f"{field_name} 必须是整数")
     try:
         result = int(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{field_name} 必须是整数") from exc
     if minimum is not None and result < minimum:
         raise ValueError(f"{field_name} 不能小于 {minimum}")
     return result
+
+
+def _coerce_bool(value: Any, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
+        return value.strip().lower() == "true"
+    raise ValueError(f"{field_name} 必须是 true / false")
 
 
 def _coerce_stopbits(value: Any) -> float:
@@ -165,6 +176,11 @@ def _parse_serial_config(raw: Any, *, profile_name: str) -> VerifySerialConfig:
         minimum=256,
     )
     encoding = str(raw.get("encoding", "utf-8")).strip() or "utf-8"
+    try:
+        "".encode(encoding)
+        codecs.getincrementaldecoder(encoding)
+    except LookupError as exc:
+        raise ValueError(f"serial.encoding 编码不可用：{encoding}") from exc
     newline = str(raw.get("newline", "\r\n"))
 
     return VerifySerialConfig(
@@ -196,12 +212,12 @@ def _parse_step(raw: Any, *, profile_name: str, index: int) -> VerifyStep:
         label=str(raw.get("label", "")).strip(),
         duration_ms=_coerce_int(raw.get("duration_ms", 0), f"步骤 {index}.duration_ms", minimum=0),
         text=str(raw.get("text", "")),
-        append_newline=bool(raw.get("append_newline", False)),
+        append_newline=_coerce_bool(raw.get("append_newline", False), f"步骤 {index}.append_newline"),
         char_delay_ms=_coerce_int(raw.get("char_delay_ms", 0), f"步骤 {index}.char_delay_ms", minimum=0),
         timeout_ms=_coerce_int(raw.get("timeout_ms", 3000), f"步骤 {index}.timeout_ms", minimum=1),
         match_mode=str(raw.get("match_mode", "all")).strip().lower() or "all",
         match_type=str(raw.get("match_type", "contains")).strip().lower() or "contains",
-        case_sensitive=bool(raw.get("case_sensitive", False)),
+        case_sensitive=_coerce_bool(raw.get("case_sensitive", False), f"步骤 {index}.case_sensitive"),
         method=str(raw.get("method", "serial_toggle")).strip().lower() or "serial_toggle",
         hold_ms=_coerce_int(raw.get("hold_ms", 120), f"步骤 {index}.hold_ms", minimum=0),
         release_wait_ms=_coerce_int(raw.get("release_wait_ms", 200), f"步骤 {index}.release_wait_ms", minimum=0),
@@ -236,6 +252,12 @@ def _parse_step(raw: Any, *, profile_name: str, index: int) -> VerifyStep:
             _parse_pattern(item, step_desc=step_desc, index=pattern_index)
             for pattern_index, item in enumerate(raw_patterns, start=1)
         ]
+        if step.match_type == "regex":
+            for pattern in step.patterns:
+                try:
+                    re.compile(pattern.pattern)
+                except re.error as exc:
+                    raise ValueError(f"步骤 {index} 的正则表达式无效：{pattern.pattern}（{exc}）") from exc
     if action == "capture":
         if step.match_mode not in {"all", "any"}:
             raise ValueError(f"配置“{profile_name}”的第 {index} 个 capture 步骤仅支持 match_mode=all/any")
@@ -267,6 +289,9 @@ def parse_verify_profile(name: str, raw: Any) -> VerifyProfile:
     profile_name = str(name).strip() or DEFAULT_VERIFY_PROFILE_NAME
     if not isinstance(raw, dict):
         raise ValueError(f"配置“{profile_name}”必须是字典")
+    raw_steps = raw.get("steps")
+    if not isinstance(raw_steps, list) or not raw_steps:
+        raise ValueError(f"配置“{profile_name}”的 steps 必须是非空列表")
 
     profile = VerifyProfile(
         name=profile_name,
@@ -274,7 +299,7 @@ def parse_verify_profile(name: str, raw: Any) -> VerifyProfile:
         serial=_parse_serial_config(raw.get("serial"), profile_name=profile_name),
         steps=[
             _parse_step(step_raw, profile_name=profile_name, index=index)
-            for index, step_raw in enumerate(raw.get("steps") or [], start=1)
+            for index, step_raw in enumerate(raw_steps, start=1)
         ],
     )
     if not profile.steps:

@@ -1,133 +1,133 @@
 # OTool Esptool UI
 
-> ESP 多设备识别 / 擦除 / 烧录 / eFuse 桌面工具 · v0.6.11
+> ESP 烧录 / eFuse / 串口校验 / 固件分合 / 多会话终端 · v0.6.15
 
-## Overview
+OTool Esptool UI 是面向 Windows 的 ESP 桌面工作台，基于 PyQt6 与 esptool，提供五个工作台和可独立运行的单文件 EXE。多设备任务共享串口占用管理，避免不同工作台同时打开同一个串口。
 
-OTool Esptool UI 是一个面向 Windows 串口量产场景的 PyQt6 桌面工具，提供 ESP32 系列芯片的自动识别、批量擦除、批量烧录、eFuse 读取与批量烧写能力，并内置 PyInstaller 单文件 EXE 打包方案。
+![烧录台](images/README/flash.jpg)
 
-![1776238814565](images/README/1776238814565.png)
-
-## Features
+## 五个工作台
 
 ### 烧录台
 
-- 自动扫描串口并识别芯片信息（型号、MAC、Flash 大小、晶振频率）
-- 多设备卡片并排显示，实时烧录进度条
-- 单台 / 全部 擦除、烧录、停止操作
-- 自动烧录模式：新设备接入后自动触发烧录
-- **多条目烧录**：工具栏支持添加 / 删除多组地址+固件，一次烧录写入多个分区
-- 地址自动从文件名末尾解析（如 `firmware_0x10000.bin`），每行独立解析
-- **清空设备**：一键移除所有设备卡片并重置 NEW 状态，下次刷新全部视为新设备
-- 固件目录自动扫描，启动时自动选中最新固件
+- 扫描串口，以设备卡片显示芯片、MAC、Flash 容量等信息；默认过滤系统和蓝牙串口，可切换“显示全部”。
+- 支持单台或批量识别、擦除、烧录、停止，以及整片或指定范围 Flash 导出。
+- 多条目烧录支持地址与固件配对；执行前检查文件可读性、空文件、32 位地址范围和 4 KiB 擦除扇区重叠。
+- 固件名尾部地址（例如 `firmware_0x10000.bin`）可自动填入；可扫描固件目录并选择最新文件。
+- 自动烧录需手动开启；停止任务或关闭自动模式后，已排队的延迟操作不会继续启动。
+- 显示结构化进度、操作日志和最终结果，刷新设备不会将已完成结果改回空闲。
 
-### 熔丝台（eFuse 批量烧写）
+### 熔丝台
 
-- **芯片型号下拉**：从 esptool 动态读取支持列表，选定型号的设备才会被纳入烧写流程，不匹配自动跳过
-- **批量状态机**：每台设备独立执行 WAITING → READING → PRE-CHECK → BURNING → VERIFYING 完整流程
-- **热插拔轮询**：可开启自动检测，每 1.5 s 扫描串口，新设备自动加入队列
-- **预检逻辑**：读取当前 eFuse JSON，已满足的字段跳过，存在写保护冲突时标记失败
-- **强制写入**：跳过状态下可点击黄色"开始"按钮忽略预检，强制再烧一次
-- **字段配置表**：可手动添加/删除字段，或从 YAML 文件导入（支持 `burn_efuse_fields` 与 `efuse_presets` 两种格式）
-- 设备队列操作按钮：按状态显示 开始 / 停止 / 重试 / 烧录 / 跳过(黄)
-- 操作日志带时间戳，可清空
-- 提供 `esp32p4_burn_efuse_config_example.yaml` 字段配置示例
+![熔丝台](images/README/efuse.jpg)
 
-### 校验台（启动日志 / 串口交互检验）
+- 选择芯片型号，手动编辑字段，或导入 `burn_efuse_fields` / `efuse_presets` YAML 配置。
+- 按设备执行读取、预检、烧写和校验流程，显示各设备状态与错误原因。
+- 已满足的字段可跳过；缺失字段、不可读数据、写保护冲突、位宽错误及不允许的 OTP 位变化会阻止烧写。
+- 强制重试仍受字段与 OTP 安全检查约束，不表示可以撤销已烧写的位。
+- 单设备 eFuse 对话框支持字段搜索、已熔丝筛选、JSON summary 和预设字段；右键快捷入口先预填并确认。
+- eFuse 烧写不可逆，执行中禁止强制终止。单设备烧写完成后需重新读取核验。
 
-- **默认可视化编排**：优先提供“积木式”步骤编辑器，可直接添加 / 删除 / 调整顺序，不必先手写 YAML
-- **多步骤脚本**：支持 `reset` / `wait` / `wait_silence` / `send_text` / `expect` / `capture` / `set_result` / `pass` / `fail` / `clear_buffer` 十类步骤
-- **步骤可折叠**：每个步骤块都可双击折叠 / 展开，复杂脚本也能保持清爽，不至于变成“意大利面 UI”
-- **启动日志判定**：可在设备复位后等待串口输出，并按多个关键字段做 `all / any / none` 匹配
-- **串口交互检验**：支持等待若干时间后向串口发送文本，再继续等待并判断回显内容
-- **步骤级失败重试**：`expect` / `capture` / `wait_silence` 等步骤可配置重试次数和重试间隔，适合设备响应不稳定场景
-- **静默等待与流程收口**：`wait_silence` 适合等待日志喷完，`pass` / `fail` 适合在脚本中主动结束流程
-- **参数读取与结果展示**：`capture` 可用正则读取版本号 / SN / MAC / 测量值，`set_result` 可将其组合展示到设备结果列
-- **匹配方式可选**：`contains` 与 `regex` 两种匹配方式，适合固定字段与正则表达式场景
-- **多设备队列**：支持手动扫描、自动校验、双击单台开始 / 停止、勾选后“全部开始”、全选 / 全不选
-- **更适合量产视角的布局**：日志下移到设备队列下方，为左侧脚本区留出更多编排空间，最大化窗口时更均衡
-- **摘要统计更直观**：脚本区显示当前配置摘要，设备区显示总数 / 勾选 / 执行中 / 通过 / 失败状态胶囊
-- **YAML 高级视图**：保留 YAML 编辑器，可从 `config.yaml` 加载默认脚本，也可导入 / 导出独立 YAML 文件
-- **统一日志区**：脚本步骤日志、串口输出、失败原因统一带时间戳记录
+### 校验台
 
-### 通用
+![校验台](images/README/verify.jpg)
 
-- 内置 eFuse 对话框，支持 JSON 格式 summary 读取与预设字段烧写
-- eFuse 表格列：状态 / 读写权限 / 字段名 / 当前值 / 描述，支持双击填入字段名
-- 右键设备卡片 eFuse 按钮可快速烧录预设 eFuse 字段
-- 多页签切换：烧录台 / 熔丝台 / 校验台（各页 toolbar 控件独立）
-- Windows 11 任务栏 / 开始菜单显示自定义图标
-- 单文件 EXE：通过 `otool_esptool_ui.spec` + PyInstaller 构建
+- 可视化步骤编排与 YAML 双视图，支持导入、导出、检查脚本和步骤折叠。
+- 支持 `reset`、`wait`、`wait_silence`、`send_text`、`expect`、`capture`、`set_result`、`pass`、`fail`、`clear_buffer`。
+- 按包含文本或正则匹配启动日志，使用 all / any / none 条件；可提取参数并组合结果摘要。
+- 配置步骤超时、失败重试、串口编码、换行和缓冲上限；增量处理分片中文与 CRLF。
+- 设备勾选队列、自动校验、单台开始/停止、批量操作和日志统计。
 
-## Python Version
+### 分合台
 
-- 最低要求：Python 3.10
-- 推荐版本：Python 3.12.x
+![分合台](images/README/merge-split.jpg)
 
-## Project Structure
+图中使用本地生成的离线 LittleFS 演示镜像，不含设备数据。
 
-```text
-otool_esptool_ui/
-├─ .gitignore
-├─ .gitmodules
-├─ LICENSE
-├─ README.md
-├─ THIRD_PARTY_NOTICES.md
-├─ __init__.py            # 包入口，供 python -m otool_esptool_ui 使用
-├─ __main__.py
-├─ otool_esptool_ui.py    # 版本号单一来源（__version__）
-├─ otool_esptool_ui.spec  # PyInstaller 打包规格
-├─ pyproject.toml
-├─ requirements.txt
-├─ config.yaml            # 运行时配置（efuse_presets / verify_profiles）
-├─ esp32p4_burn_efuse_config_example.yaml  # eFuse 字段配置示例（不打包）
-├─ logo_all_size.ico      # 应用图标（含 16–256px 全尺寸帧）
-├─ assets/
-│   └─ onexs_avatar.png
-├─ firmware/              # 放置待烧录 .bin 固件，启动时自动识别
-├─ src/
-│   ├─ bootstrap.py       # 启动分发：冻结模式/工作进程/Qt DLL 路径
-│   ├─ constants.py       # 路径、版本、工具命令等常量
-│   ├─ main_window.py     # 主窗口 + main() 入口
-│   ├─ device_card.py     # 设备卡片控件
-│   ├─ efuse_dialog.py    # eFuse 对话框（单设备）
-│   ├─ efuse_batch_dialog.py  # 熔丝台批量烧写控件
-│   ├─ verify_plan.py     # 校验台脚本解析 / 匹配逻辑
-│   ├─ verify_visual_editor.py  # 校验台可视化积木编辑器
-│   ├─ verify_widget.py   # 校验台批量检验控件
-│   ├─ models.py          # 数据模型
-│   ├─ helpers.py         # 头像下载等辅助函数
-│   ├─ styles.py          # 共享样式表
-│   ├─ flow_layout.py     # 自适应流式布局
-│   └─ assets/
-│       └─ chevron_down.svg
-└─ esptool/               # Git 子模块（espressif/esptool）
-```
+- 分析合并固件中的分区表，提取 bootloader、分区表和分区原始数据；保留合法的尾部 `0xFF`。
+- 按地址合并多份固件，支持 raw BIN、Intel HEX、UF2；检查范围重叠和输出覆盖输入。
+- 合并成功的 raw BIN 可发送到烧录台；HEX/UF2 不作为原始二进制烧录条目传递。
+- 显示可复制的 MD5、SHA-1、SHA-256；支持从设备读取镜像后分析。
+- **LittleFS 文件浏览**：只读挂载、目录浏览和文件提取，保留子目录结构；挂载失败不会格式化镜像副本或显示伪成功。
+- FAT / SPIFFS 支持分区识别与原始分区提取，**不支持内部文件浏览**。加密、损坏或参数不匹配的镜像不保证可解析。
 
-## Quickstart（源码运行）
+### 终端台
+
+![标准终端](images/README/terminal.jpg)
+
+- 多会话串口终端，支持标准终端、文本终端与 Unix 终端模式。
+- 配置波特率、数据位、校验、停止位、流控、编码与换行；文本/HEX 收发、时间戳、日志筛选和导出。
+- 支持监听、断线重连、快捷发送和复位；后台会话重连不切走当前会话。
+- 发送处理部分写入，连续发送时仍保留接收机会。
+- 精简模式隐藏应用外壳；全屏可独立切换。
+
+![Unix 终端](images/README/unix-terminal.jpg)
+
+Unix 模式提供 ANSI/VT 屏幕仿真、方向键和控制键、直接键盘输入与粘贴，适合串口 Shell。它不是本机命令行，也不是 SSH 客户端；设备端需要提供对应串口服务。
+
+## 界面与配置
+
+- 小屏或高 DPI 下工作区自动提供滚动，底部导航保持可见；窄窗口下导航与版本信息分两行。
+- “引用说明”显示实际组件版本、上游发布日期和来源；无需联网即可查看构建清单。
+- `config.yaml` 保存 eFuse 预设与 `verify_profiles`；示例见 `esp32p4_burn_efuse_config_example.yaml`。
+- 源码运行时读取项目内配置；单文件 EXE 使用构建时嵌入的默认配置；校验台优先读取 EXE 旁的 `config.yaml`，运行中也可通过界面导入 YAML。
+- 默认查找程序附近的 `firmware` 目录；可使用 `OTOOL_ESPTOOL_UI_FIRMWARE_DIR` 指定固件目录。
+- Windows 任务栏快捷任务可进入烧录、分合、标准终端或 Unix 终端；也可使用 `--tab 0..4` 与 `--terminal-mode terminal|unix|plain`。
+
+## 源码运行
+
+最低 Python 3.10；本次 Windows x64 发布使用 **Python 3.12.10**。锁定清单面向该构建环境。
 
 ```powershell
-# 1. 克隆并初始化子模块
-git clone --recurse-submodules <repo_url>
+git clone --recurse-submodules https://github.com/onexs-xsi/otool_esptool_ui.git
 cd otool_esptool_ui
-
-# 2. 创建并激活虚拟环境
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-
-# 3. 安装依赖
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-
-# 4. 运行
-python otool_esptool_ui.py
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe otool_esptool_ui.py
 ```
 
-## Packaging
+`esptool` 子模块固定到正式版本 v5.4.0。未初始化或不完整时使用安装环境中的 esptool；正式构建前需确保子模块和安装版本一致。普通源码运行无需 PyInstaller。
 
-Windows 下运行 `./management_tools.ps1` 可打开管理界面，支持选择 Python 版本、自动下载 Python zip 并初始化 `.venv`、删除环境、运行程序，以及执行打包生成单文件 `dist/otool_esptool_ui.exe`。
+也可使用管理脚本创建/复用环境，默认 Python 版本为 3.12.10：
+
+```powershell
+.\management_tools.ps1 -Action init-env
+.\management_tools.ps1 -Action run-app
+```
+
+不传参数可打开环境与打包管理界面。Python 可来自系统或脚本下载的本地工具目录；切换已有环境的 Python 版本需要明确重建环境。
+
+## 测试与打包
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests
+.\.venv\Scripts\python.exe -m pip check
+.\management_tools.ps1 -Action package -PythonVersion 3.12.10
+```
+
+- 运行清单：`requirements.txt`；构建清单：`requirements-build.txt`（包含运行依赖与 PyInstaller、hooks、setuptools、pip）。两者均锁定具体版本。
+- 依赖声明维护在 `pyproject.toml`；构建清单通过同一依赖源的 `build` extra 生成。刷新清单后必须重跑回归与 EXE 检查。
+- 每次构建前递增补丁版本，同步入口 `__version__`、项目元数据、README 当前版本及常量回退版本；失败后的重试同样递增。`file_version_info.txt` 由 spec 自动生成。
+- 构建检查 Qt 启动、esptool / espefuse / espsecure 分发、Qt/ICU DLL 与 cryptography 原生扩展，输出 `dist/otool_esptool_ui.exe`。
+- 单文件 EXE 不需要本机 Python。请保留 [第三方组件说明](THIRD_PARTY_NOTICES.md)，并按需准备固件与独立 YAML 文件。
+
+界面矩阵可通过 `tests/ui_matrix.py` 离屏复现；它只使用模拟空串口，不访问设备。截图来自软件真实运行界面，未展示虚构烧录结果。
+
+## 本次验证边界
+
+本次使用自动回归、模拟串口、离线固件和实际 EXE 验证；**未连接真实 ESP 设备**。真实 USB 热插拔时序、芯片复位、Flash 擦写结果、板级串口行为及 eFuse 写后结果尚需设备验证。详细结果见 [本次检查记录](review_20261003.md)。
 
 ## Changelog
+
+### v0.6.15
+
+- 升级 esptool 5.4.0、终端宽度计算库和构建工具，锁定运行与构建依赖。
+- 适配 esp-pylib 日志代理，修复工作进程崩溃，统一 JSON 事件 UTF-8 编码。
+- 修复 LittleFS 无效镜像被自动格式化后误报成功，以及有效镜像块参数探测失败。
+- 修复空 esptool 子模块误判、窄窗口/高 DPI 内容不可达、编码字段裁切和引用说明窗口过大。
+- 修复 EXE 下拉箭头资源路径、内置校验配置读取及后台头像刷新。
+- 整合已有设备状态、任务取消、串口互斥、固件处理与校验流程修复。
+- 更新五个工作台能力说明、界面截图和第三方组件清单。
 
 ### v0.2.0
 
@@ -153,4 +153,4 @@ Windows 下运行 `./management_tools.ps1` 可打开管理界面，支持选择 
 
 ## License
 
-- [OTool Esptool UI - MIT](LICENSE)
+本项目源码采用 [MIT](LICENSE)。第三方依赖遵循各自许可证，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

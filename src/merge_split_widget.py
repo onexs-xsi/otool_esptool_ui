@@ -11,9 +11,10 @@ import os
 import re
 import struct
 import subprocess
+import time
 from pathlib import Path
 
-from PyQt6.QtCore import QProcess, QProcessEnvironment, Qt, pyqtSignal
+from PyQt6.QtCore import QProcess, QProcessEnvironment, Qt, QSize, pyqtSignal
 from PyQt6.QtGui import QFont, QTextCursor, QCursor
 from PyQt6.QtWidgets import (
     QApplication,
@@ -99,6 +100,31 @@ def _human_size(n: int) -> str:
     return f"{val:g}GB"
 
 
+def _partition_filename(name: str, offset: int) -> str:
+    """Keep labels from untrusted firmware inside a single output filename."""
+    safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
+    safe_name = safe_name or "partition"
+    if safe_name.split(".", 1)[0].upper() in {
+        "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
+        *(f"COM{i}" for i in range(1, 10)),
+        *(f"LPT{i}" for i in range(1, 10)),
+    }:
+        safe_name = "_" + safe_name
+    return f"{safe_name}_{offset:#010x}.bin"
+
+
+def _contained_output_path(directory: Path, relative: str) -> Path:
+    """Reject traversal, absolute Windows paths and links outside the output tree."""
+    parts = relative.replace("\\", "/").split("/")
+    if any(part in (".", "..") or re.search(r'[<>:"|?*\x00-\x1f]', part) for part in parts):
+        raise ValueError(f"无效的提取路径：{relative}")
+    root = directory.resolve()
+    target = (root / relative).resolve()
+    if not target.is_relative_to(root):
+        raise ValueError(f"提取路径超出输出目录：{relative}")
+    return target
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  分区表解析工具
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -113,9 +139,9 @@ def _parse_partition_table(blob: bytes) -> list[dict]:
         if magic == 0xFFFF:
             break
         if magic == PT_MD5_MAGIC:
-            continue
+            break
         if magic != PT_MAGIC:
-            continue
+            break
         p_type = rec[2]
         subtype = rec[3]
         offset, size = struct.unpack_from("<II", rec, 4)
@@ -125,9 +151,11 @@ def _parse_partition_table(blob: bytes) -> list[dict]:
         type_str = PARTITION_TYPES.get(p_type, f"type_{p_type:#x}")
         if p_type == 0:
             subtype_str = APP_SUBTYPES.get(subtype, f"sub_{subtype:#x}")
-        else:
+        elif p_type == 1:
             subtype_str = DATA_SUBTYPES.get(subtype, f"sub_{subtype:#x}")
-        flags = struct.unpack_from("<H", rec, 28)[0]
+        else:
+            subtype_str = f"sub_{subtype:#x}"
+        flags = struct.unpack_from("<I", rec, 28)[0]
         encrypted = bool(flags & 0x1)
         entries.append({
             "name": name, "type_str": type_str, "subtype_str": subtype_str,
@@ -167,9 +195,16 @@ def analyze_merged_bin(data: bytes, chip: str = "auto") -> dict:
         "partitions": [], "warnings": [],
     }
     pt_offset = _detect_partition_table_offset(data)
+    pt_blob = data[pt_offset: pt_offset + 0xC00]
+    entries = _parse_partition_table(pt_blob)
+    if not entries:
+        result["warnings"].append("未能解析有效分区表，可能是加密固件或非标准格式。")
+        return result
     bl_off = _detect_bootloader_offset(data, chip)
     if bl_off is not None:
-        bl_raw = data[bl_off:pt_offset].rstrip(b"\xff")
+        # Trailing 0xFF can belong to an image checksum, hash or signature.
+        # Preserve the entire reserved region instead of guessing its length.
+        bl_raw = data[bl_off:pt_offset]
         result["bootloader"] = {
             "name": "bootloader", "offset": bl_off,
             "size": len(bl_raw), "type_str": "bootloader",
@@ -179,19 +214,11 @@ def analyze_merged_bin(data: bytes, chip: str = "auto") -> dict:
         result["warnings"].append(
             f"分区表偏移非默认值: {pt_offset:#x}（默认 {PT_OFFSET_DEFAULT:#x}）"
         )
-    pt_raw_max = 0xC00
-    pt_blob = data[pt_offset: pt_offset + pt_raw_max]
-    pt_trimmed = pt_blob.rstrip(b"\xff")
-    pt_size = min(len(pt_trimmed) + PT_ENTRY_SIZE, pt_raw_max)
     result["partition_table"] = {
         "name": "partition-table", "offset": pt_offset,
-        "size": pt_size, "type_str": "partition-table",
+        "size": len(pt_blob), "type_str": "partition-table",
         "subtype_str": "-", "encrypted": False,
     }
-    entries = _parse_partition_table(pt_blob)
-    if not entries:
-        result["warnings"].append("未能解析有效分区表，可能是加密固件或非标准格式。")
-        return result
     for e in entries:
         off, sz = e["offset"], e["size"]
         if off + sz > len(data):
@@ -214,20 +241,21 @@ def analyze_merged_bin(data: bytes, chip: str = "auto") -> dict:
 #  文件系统浏览对话框
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_FS_SUBTYPES = frozenset({"spiffs", "littlefs", "fat"})
+_FS_SUBTYPES = frozenset({"littlefs"})
 
 
 class _FsViewerDialog(QDialog):
-    """浏览嵌入式文件系统（LittleFS / FAT）的内容。"""
+    """只读浏览 LittleFS；其他文件系统仅支持原始分区提取。"""
 
     def __init__(self, part_name: str, subtype: str, data: bytes,
                  parent: QWidget | None = None):
         super().__init__(parent)
         self.setWindowTitle(f"文件浏览 — {part_name}（{subtype}）")
-        self.setMinimumSize(640, 440)
-        self.resize(740, 520)
+        self.setMinimumSize(640, 320)
+        self.resize(QSize(740, 520).boundedTo(self.screen().availableGeometry().size() - QSize(24, 48)))
         self._fs = None
         self._buf: bytearray | None = None
+        self._subtype = subtype
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(12, 10, 12, 10)
@@ -266,6 +294,13 @@ class _FsViewerDialog(QDialog):
     # ── 挂载 ──────────────────────────────────────────────────────────────────
 
     def _try_mount(self, data: bytes) -> None:
+        self._extract_sel_btn.setEnabled(False)
+        self._extract_all_btn.setEnabled(False)
+        if self._subtype not in _FS_SUBTYPES:
+            self._status_lbl.setText(
+                f"不支持浏览 {self._subtype} 文件系统；请返回分合台提取原始分区。"
+            )
+            return
         try:
             import littlefs as _lfs
         except ImportError:
@@ -276,15 +311,18 @@ class _FsViewerDialog(QDialog):
 
         for block_size in (4096, 8192, 2048, 16384):
             block_count = len(data) // block_size
-            if block_count < 2:
+            if block_count < 2 or len(data) % block_size:
                 continue
             try:
                 self._buf = bytearray(data)
                 ctx = _lfs.UserContext(buffsize=len(self._buf), buffer=self._buf)
                 fs = _lfs.LittleFS(
                     context=ctx, block_size=block_size,
-                    block_count=block_count, mount=True,
+                    block_count=block_count, mount=False,
                 )
+                # LittleFS(mount=True) formats on a failed mount. An image
+                # viewer must instead try parameters without modifying data.
+                fs.mount()
                 self._fs = fs
                 self._status_lbl.setText(
                     f"✓ LittleFS 已挂载  "
@@ -293,13 +331,15 @@ class _FsViewerDialog(QDialog):
                     f"大小={_human_size(len(data))}"
                 )
                 self._populate_tree(fs)
+                self._extract_sel_btn.setEnabled(True)
+                self._extract_all_btn.setEnabled(True)
                 return
             except Exception:
                 self._buf = None
                 continue
 
         self._status_lbl.setText(
-            "⚠ 无法解析此文件系统（可能是 SPIFFS 格式、数据为空或块参数不匹配）"
+            "⚠ LittleFS 挂载失败：镜像损坏、数据为空或块参数不匹配；未修改镜像。"
         )
 
     # ── 构建文件树 ─────────────────────────────────────────────────────────────
@@ -357,14 +397,26 @@ class _FsViewerDialog(QDialog):
         if not out_dir:
             return
         out = Path(out_dir)
-        count = 0
+        count, errors = 0, []
         for item in items:
             fpath = item.data(0, Qt.ItemDataRole.UserRole)
             raw = self._read_file(fpath)
-            if raw is not None:
-                (out / Path(fpath).name).write_bytes(raw)
+            if raw is None:
+                errors.append(fpath)
+                continue
+            try:
+                # Preserve directories so selected files with equal basenames
+                # cannot silently overwrite one another.
+                target = _contained_output_path(out, fpath.lstrip("/"))
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(raw)
                 count += 1
-        QMessageBox.information(self, "完成", f"已提取 {count} 个文件到\n{out_dir}")
+            except (OSError, ValueError):
+                errors.append(fpath)
+        msg = f"已提取 {count} 个文件到\n{out_dir}"
+        if errors:
+            msg += f"\n⚠ {len(errors)} 个文件提取失败"
+        QMessageBox.information(self, "完成", msg)
 
     def _extract_all(self) -> None:
         if self._fs is None:
@@ -377,14 +429,14 @@ class _FsViewerDialog(QDialog):
         try:
             for dirpath, _, files in self._fs.walk("/"):
                 rel = dirpath.strip("/")
-                sub = out / rel if rel else out
+                sub = _contained_output_path(out, rel)
                 sub.mkdir(parents=True, exist_ok=True)
                 base = "/" + rel
                 for fname in files:
                     fpath = base.rstrip("/") + "/" + fname
                     raw = self._read_file(fpath)
                     if raw is not None:
-                        (sub / fname).write_bytes(raw)
+                        _contained_output_path(sub, fname).write_bytes(raw)
                         count += 1
                     else:
                         errors.append(fpath)
@@ -533,12 +585,17 @@ class MergeSplitWidget(QWidget):
         super().__init__(parent)
         self._port_registry = port_registry or GLOBAL_PORT_OWNERSHIP
         self._merge_process: QProcess | None = None
+        self._merge_run_output = ""
+        self._merge_run_format = ""
+        self._merge_completed_output = ""
+        self._merge_completed_format = ""
         self._split_device_process: QProcess | None = None
         self._split_device_lease: PortLease | None = None
         self._split_device_temp_path = ""
         self._merge_rows: list[_EntryRow] = []
         self._split_data: bytes = b""
         self._split_result: dict | None = None
+        self._split_rows_data: list[dict] = []
         self._init_ui()
 
     # ── UI 构建 ───────────────────────────────────────────────────────────────
@@ -819,6 +876,8 @@ class MergeSplitWidget(QWidget):
 
         # 初始化第一条合成条目
         self._merge_add_entry()
+        self._split_input_edit.textChanged.connect(self._clear_split_analysis)
+        self._split_chip_combo.currentTextChanged.connect(self._clear_split_analysis)
 
     # ── 日志 ──────────────────────────────────────────────────────────────────
 
@@ -1041,26 +1100,54 @@ class MergeSplitWidget(QWidget):
     def has_active_device_read(self) -> bool:
         return self._split_device_process is not None
 
+    def has_active_merge(self) -> bool:
+        return self._merge_process is not None
+
     def shutdown(self, wait_ms: int = 1500) -> bool:
-        proc = self._split_device_process
-        if proc is None:
+        deadline = time.monotonic() + max(0, wait_ms) / 1000
+        all_stopped = True
+        for attribute in ("_merge_process", "_split_device_process"):
+            proc = getattr(self, attribute)
+            if proc is None:
+                continue
+            # Stopping must not trigger a probe callback that starts another read.
+            proc.blockSignals(True)
+            proc.kill()
+            remaining = max(0, int((deadline - time.monotonic()) * 1000))
+            stopped = (
+                proc.state() == QProcess.ProcessState.NotRunning
+                or proc.waitForFinished(remaining)
+            )
+            proc.blockSignals(False)
+            if stopped:
+                setattr(self, attribute, None)
+                proc.deleteLater()
+            else:
+                all_stopped = False
+        if self._split_device_process is None:
             self._finish_split_device_read(success=False)
-            return True
-        proc.kill()
-        stopped = proc.waitForFinished(max(0, wait_ms))
-        self._split_device_process = None
-        proc.deleteLater()
-        self._finish_split_device_read(success=False)
-        return stopped
+        if self._merge_process is None:
+            self._merge_run_btn.setEnabled(True)
+        return all_stopped
 
     def _split_analyze(self) -> None:
+        self._clear_split_analysis()
         path = self._split_input_edit.text().strip()
         if not path or not Path(path).is_file():
             QMessageBox.warning(self, "提示", "请先选择有效的输入文件。")
             return
         self._split_do_analyze(path)
 
+    def _clear_split_analysis(self) -> None:
+        self._split_data = b""
+        self._split_result = None
+        self._split_rows_data = []
+        self._split_table.setRowCount(0)
+        self._split_extract_btn.setEnabled(False)
+        self._update_hash_display()
+
     def _split_do_analyze(self, path: str) -> None:
+        self._clear_split_analysis()
         try:
             data = Path(path).read_bytes()
         except Exception as exc:
@@ -1126,7 +1213,7 @@ class MergeSplitWidget(QWidget):
             elif subtype in _FS_SUBTYPES:
                 name_item = self._split_table.item(i, 0)
                 if name_item:
-                    name_item.setToolTip("双击以浏览内部文件（LittleFS / FAT）")
+                    name_item.setToolTip("双击只读浏览 LittleFS 内部文件")
             self._append_log(
                 f"  {r['offset']:#010x}  {_human_size(r['size']):>8s}  "
                 f"{r['type_str']:<16s} {r['name']}"
@@ -1213,7 +1300,7 @@ class MergeSplitWidget(QWidget):
             return
         row = self._split_rows_data[idx]
         off, sz = row["offset"], row["size"]
-        default_name = f"{row['name']}_{off:#010x}.bin"
+        default_name = _partition_filename(row["name"], off)
         # 总是弹出另存为对话框，让用户自己决定保存位置
         save_path, _ = get_save_file_name(
             self, "保存提取文件",
@@ -1241,15 +1328,19 @@ class MergeSplitWidget(QWidget):
             self._split_output_edit.setText(chosen)
             out_str = chosen
         out_dir = Path(out_str)
-        out_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._append_log(f"✕ 无法创建输出目录: {exc}")
+            return
         self._append_log(f"═══ 全部提取到 {out_dir} ═══")
         ok_count = 0
         for row in self._split_rows_data:
             off, sz = row["offset"], row["size"]
             chunk = self._split_data[off: off + sz]
-            fname = f"{row['name']}_{off:#010x}.bin"
+            fname = _partition_filename(row["name"], off)
             try:
-                (out_dir / fname).write_bytes(chunk)
+                _contained_output_path(out_dir, fname).write_bytes(chunk)
                 self._append_log(f"  ✓ {fname} ({_human_size(sz)})")
                 ok_count += 1
             except Exception as exc:
@@ -1399,6 +1490,7 @@ class MergeSplitWidget(QWidget):
 
     def _merge_validate(self) -> list[tuple[str, str]] | None:
         entries: list[tuple[str, str]] = []
+        ranges: list[tuple[int, int, str]] = []
         for row in self._merge_rows:
             addr = row.addr_edit.text().strip()
             path = row.path_edit.text().strip()
@@ -1410,10 +1502,28 @@ class MergeSplitWidget(QWidget):
             if not path or not Path(path).is_file():
                 QMessageBox.warning(self, "提示", f"固件文件无效：{path!r}")
                 return None
+            try:
+                size = Path(path).stat().st_size
+            except OSError as exc:
+                QMessageBox.warning(self, "提示", f"无法读取固件文件：{exc}")
+                return None
+            offset = int(addr, 16)
+            if size <= 0 or offset + size > 0x100000000:
+                QMessageBox.warning(self, "提示", "固件文件不能为空，且地址范围不能超过 32 位。")
+                return None
+            ranges.append((offset, offset + size, path))
             entries.append((addr, path))
         if not entries:
             QMessageBox.warning(self, "提示", "请至少填写一个有效的合成条目。")
             return None
+        ordered = sorted(ranges)
+        for previous, current in zip(ordered, ordered[1:]):
+            if current[0] < previous[1]:
+                QMessageBox.warning(
+                    self, "提示",
+                    f"固件地址范围重叠：{Path(previous[2]).name} 与 {Path(current[2]).name}。",
+                )
+                return None
         return entries
 
     def _merge_run(self) -> None:
@@ -1441,6 +1551,21 @@ class MergeSplitWidget(QWidget):
                 return
             self._merge_output_edit.setText(save_path)
             output = save_path
+        try:
+            output_path = Path(output).resolve()
+            if any(
+                output_path == Path(path).resolve()
+                or (output_path.exists() and output_path.samefile(path))
+                for _addr, path in entries
+            ):
+                QMessageBox.warning(self, "提示", "输出文件不能与输入固件相同。")
+                return
+            # QProcess runs in TOOL_DIR; resolve UI paths before changing cwd.
+            output = str(output_path)
+            entries = [(addr, str(Path(path).resolve())) for addr, path in entries]
+        except OSError as exc:
+            QMessageBox.warning(self, "提示", f"文件路径无效：{exc}")
+            return
         out_dir = Path(output).parent
         if not out_dir.exists():
             try:
@@ -1468,6 +1593,10 @@ class MergeSplitWidget(QWidget):
         self._merge_send_btn.setEnabled(False)
         self._merge_progress.setValue(0)
         self._merge_progress.setFormat("合成中…")
+        self._merge_run_output = output
+        self._merge_run_format = fmt
+        self._merge_completed_output = ""
+        self._merge_completed_format = ""
 
         process = QProcess(self)
         self._merge_process = process
@@ -1493,29 +1622,50 @@ class MergeSplitWidget(QWidget):
             for line in text.splitlines():
                 self._append_log(line)
 
-    def _merge_finished(self, exit_code: int, _exit_status) -> None:
+    def _merge_finished(self, exit_code: int, exit_status) -> None:
+        process = self._merge_process
+        if process is None:
+            return
+        self._merge_read_output()
         self._merge_process = None
+        process.deleteLater()
         self._merge_run_btn.setEnabled(True)
-        if exit_code == 0:
-            output = self._merge_output_edit.text().strip()
+        self._merge_send_btn.setEnabled(False)
+        if exit_code == 0 and exit_status == QProcess.ExitStatus.NormalExit:
+            output = self._merge_run_output
             try:
                 sz = Path(output).stat().st_size
-                sz_str = _human_size(sz)
-            except Exception:
-                sz_str = "?"
+                if sz <= 0 or not Path(output).is_file():
+                    raise OSError("输出文件为空或不是普通文件")
+            except OSError as exc:
+                self._append_log(f"✕ 合成未生成有效输出文件：{exc}")
+                self._merge_progress.setFormat("合成失败")
+                return
+            sz_str = _human_size(sz)
             self._append_log(f"✓ 合成成功 → {output} ({sz_str})")
             self._merge_progress.setValue(100)
             self._merge_progress.setFormat("完成 100%")
-            self._merge_send_btn.setEnabled(True)
+            self._merge_completed_output = output
+            self._merge_completed_format = self._merge_run_format
+            is_raw = self._merge_completed_format == "raw"
+            self._merge_send_btn.setEnabled(is_raw)
+            self._merge_send_btn.setToolTip(
+                output if is_raw else "只有 raw 二进制固件可以发送到烧录台。"
+            )
         else:
             self._append_log(f"✕ 合成失败 (exit code {exit_code})")
             self._merge_progress.setFormat("合成失败")
 
     def _merge_error(self, error) -> None:
-        self._merge_process = None
-        self._merge_run_btn.setEnabled(True)
         self._append_log(f"✕ 进程错误: {error}")
         self._merge_progress.setFormat("进程错误")
+        if error == QProcess.ProcessError.FailedToStart:
+            process = self._merge_process
+            self._merge_process = None
+            if process is not None:
+                process.deleteLater()
+            self._merge_run_btn.setEnabled(True)
+            self._merge_send_btn.setEnabled(False)
 
     def _merge_stop(self) -> None:
         if self._merge_process is not None:
@@ -1523,8 +1673,12 @@ class MergeSplitWidget(QWidget):
             self._append_log("已停止合成。")
 
     def _merge_send_to_flash(self) -> None:
-        output = self._merge_output_edit.text().strip()
-        if output and Path(output).is_file():
+        output = self._merge_completed_output
+        if (
+            self._merge_process is None
+            and self._merge_completed_format == "raw"
+            and output and Path(output).is_file()
+        ):
             self.send_to_flash_station.emit(output)
         else:
             QMessageBox.warning(self, "提示", "合成文件不存在，请先执行合成。")

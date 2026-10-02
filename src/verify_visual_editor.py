@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -29,13 +31,18 @@ from .verify_plan import (
 
 
 class _DownComboBox(QComboBox):
-    """始终向下弹出的 QComboBox，解决嵌套 ScrollArea 内弹出位置漂移问题。"""
+    """优先向下弹出，空间不足时向上，且不越出当前屏幕。"""
 
     def showPopup(self) -> None:
         super().showPopup()
         container = self.view().parentWidget()
         if container is not None:
             pos = self.mapToGlobal(self.rect().bottomLeft())
+            available = self.screen().availableGeometry()
+            pos.setX(max(available.left(), min(pos.x(), available.right() - container.width() + 1)))
+            if pos.y() + container.height() > available.bottom() + 1:
+                pos.setY(self.mapToGlobal(self.rect().topLeft()).y() - container.height())
+            pos.setY(max(available.top(), min(pos.y(), available.bottom() - container.height() + 1)))
             container.move(pos)
 
 
@@ -90,8 +97,8 @@ def _escape_control_text(text: str) -> str:
 
 
 def _unescape_control_text(text: str) -> str:
-    result = text.replace("\\r", "\r").replace("\\n", "\n").replace("\\t", "\t")
-    return result.replace("\\\\", "\\")
+    controls = {"r": "\r", "n": "\n", "t": "\t", "\\": "\\"}
+    return re.sub(r"\\([rnt\\])", lambda match: controls[match.group(1)], text)
 
 
 def _find_combo_index_by_value(combo: QComboBox, value: str) -> int:
@@ -942,8 +949,10 @@ class VerifyVisualEditor(QWidget):
         for item in _STOP_BITS_OPTIONS:
             self._stopbits_combo.addItem(item)
         self._encoding_edit = QLineEdit("utf-8")
+        self._encoding_edit.setMinimumWidth(110)
         self._encoding_edit.setObjectName("stepInlineEdit")
         self._newline_edit = QLineEdit("\\r\\n")
+        self._newline_edit.setMinimumWidth(88)
         self._newline_edit.setObjectName("stepInlineEdit")
         self._newline_edit.setPlaceholderText(r"例如：\r\n / \n")
 
@@ -996,8 +1005,20 @@ class VerifyVisualEditor(QWidget):
         add_bar = QHBoxLayout()
         add_bar.setContentsMargins(0, 0, 0, 0)
         add_bar.setSpacing(6)
+        short_labels = {
+            "wait_silence": "静默",
+            "send_text": "发送",
+            "expect": "匹配",
+            "capture": "读取",
+            "set_result": "结果",
+            "pass": "通过",
+            "fail": "失败",
+            "clear_buffer": "清空",
+        }
         for action, label in _ACTION_LABELS.items():
-            button = QPushButton(f"＋ {label}")
+            button = QPushButton(f"＋ {short_labels.get(action, label)}")
+            button.setToolTip(f"添加步骤：{label}")
+            button.setAccessibleName(f"添加步骤：{label}")
             button.setObjectName("stepAddButton")
             button.clicked.connect(lambda _=False, a=action: self.add_step_block(action=a))
             add_bar.addWidget(button)

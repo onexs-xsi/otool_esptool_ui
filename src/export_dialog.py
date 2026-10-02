@@ -246,7 +246,15 @@ class ExportFlashDialog(QDialog):
             self.address_edit.setFocus()
             return
         if not self._valid_size(size):
-            QMessageBox.warning(self, "提示", "读取大小格式不正确，请输入 ALL、16M、512k 或 0x100000 等。")
+            QMessageBox.warning(self, "提示", "读取大小必须大于 0，请输入 ALL、16M、512k 或 0x100000 等。")
+            self.size_combo.setFocus()
+            return
+        if size.lower() == "all" and int(address, 16) != 0:
+            QMessageBox.warning(self, "提示", "ALL 表示整片 Flash，起始地址必须为 0x0；读取局部区域请填写具体大小。")
+            self.address_edit.setFocus()
+            return
+        if size.lower() != "all" and int(address, 16) + self._size_bytes(size) > 0x100000000:
+            QMessageBox.warning(self, "提示", "起始地址与读取大小之和不能超过 32 位地址范围。")
             self.size_combo.setFocus()
             return
         normalized_size = self._normalize_size_for_esptool(size)
@@ -256,7 +264,16 @@ class ExportFlashDialog(QDialog):
             QMessageBox.warning(self, "提示", "文件名不能为空。")
             self.filename_edit.setFocus()
             return
-        if any(ch in filename for ch in self._INVALID_FILENAME_CHARS):
+        if (
+            any(ch in filename for ch in self._INVALID_FILENAME_CHARS)
+            or any(ord(ch) < 32 for ch in filename)
+            or filename.endswith(".")
+            or filename.split(".", 1)[0].upper() in {
+                "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
+                *(f"COM{i}" for i in range(1, 10)),
+                *(f"LPT{i}" for i in range(1, 10)),
+            }
+        ):
             QMessageBox.warning(self, "提示", "文件名包含 Windows 不支持的字符。")
             self.filename_edit.setFocus()
             return
@@ -266,17 +283,23 @@ class ExportFlashDialog(QDialog):
 
     @staticmethod
     def _valid_address(value: str) -> bool:
-        return bool(re.fullmatch(r"0[xX][0-9a-fA-F]+", value))
+        return bool(re.fullmatch(r"0[xX][0-9a-fA-F]+", value)) and int(value, 16) <= 0xFFFFFFFF
+
+    @staticmethod
+    def _size_bytes(value: str) -> int:
+        if value.lower().startswith("0x"):
+            return int(value, 16)
+        if value[-1:].lower() in ("k", "m"):
+            return int(value[:-1]) * (1024 if value[-1:].lower() == "k" else 1024**2)
+        return int(value, 10)
 
     @staticmethod
     def _valid_size(value: str) -> bool:
         if value.lower() == "all":
             return True
-        if re.fullmatch(r"0[xX][0-9a-fA-F]+", value):
-            return True
-        if re.fullmatch(r"\d+", value):
-            return True
-        return bool(re.fullmatch(r"\d+[kKmM]", value))
+        if not re.fullmatch(r"(?:0[xX][0-9a-fA-F]+|[0-9]+[kKmM]?)", value):
+            return False
+        return 0 < ExportFlashDialog._size_bytes(value) <= 0x100000000
 
     @staticmethod
     def _normalize_size_for_esptool(value: str) -> str:

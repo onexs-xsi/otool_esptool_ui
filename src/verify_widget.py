@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import re
 import subprocess
 import time
@@ -30,7 +31,7 @@ from PyQt6.QtWidgets import (
 )
 from serial.tools import list_ports
 
-from .constants import TOOL_DIR, _build_process_env_dict, _build_tool_command
+from .constants import TOOL_DIR, _build_process_env_dict, _build_tool_command, _resource_root
 from .dialog_memory import get_open_file_name, get_save_file_name
 from .port_ownership import GLOBAL_PORT_OWNERSHIP, PortLease, PortOwnershipRegistry
 from .styles import BASE_STYLESHEET
@@ -153,6 +154,8 @@ class VerifyWorker(QObject):
         self._stop_requested = False
         self._buffer = ""
         self._line_buffer = ""
+        self._decoder = codecs.getincrementaldecoder(profile.serial.encoding)(errors="replace")
+        self._last_was_cr = False
         self._captured_values: dict[str, str] = {}
         self._result_text = ""
 
@@ -160,7 +163,9 @@ class VerifyWorker(QObject):
         self._stop_requested = True
 
     def run(self) -> None:
+        outcome, summary = "failed", "任务未完成"
         try:
+            self._ensure_not_stopped()
             self._open_serial()
             self._emit_log(
                 f"已打开串口 {self._port} @ {self._profile.serial.baudrate} bps"
@@ -175,23 +180,25 @@ class VerifyWorker(QObject):
             self._pump_serial(120)
             self._flush_line_buffer()
             self._emit_result_preview()
-            self.finished.emit("passed", "全部步骤通过")
+            outcome, summary = "passed", "全部步骤通过"
         except _VerificationPassed as exc:
             if exc.summary:
                 self._result_text = exc.summary
             self._emit_result_preview()
             self._emit_log(f"任务提前通过：{exc.summary or '脚本主动通过'}")
-            self.finished.emit("passed", exc.summary or "脚本主动通过")
+            outcome, summary = "passed", exc.summary or "脚本主动通过"
         except _VerificationStopped:
             self._emit_result_preview()
             self._emit_log("任务已停止")
-            self.finished.emit("stopped", "用户停止")
+            outcome, summary = "stopped", "用户停止"
         except Exception as exc:  # noqa: BLE001
             self._emit_result_preview()
             self._emit_log(f"任务失败：{exc}")
-            self.finished.emit("failed", str(exc))
+            outcome, summary = "failed", str(exc)
         finally:
             self._close_serial()
+            self._flush_line_buffer()
+            self.finished.emit(outcome, summary)
 
     def _run_step(self, step: VerifyStep) -> None:
         max_attempts = max(1, step.retry_count + 1)
@@ -260,7 +267,7 @@ class VerifyWorker(QObject):
         )
         deadline = time.monotonic() + step.timeout_ms / 1000.0
         silence_start = time.monotonic()
-        while time.monotonic() < deadline:
+        while True:
             self._ensure_not_stopped()
             had_data = self._read_once()
             now = time.monotonic()
@@ -367,10 +374,8 @@ class VerifyWorker(QObject):
             f"开始等待匹配（{step.match_mode}/{step.match_type}, {step.timeout_ms} ms）：{patterns_text}"
         )
         deadline = time.monotonic() + step.timeout_ms / 1000.0
-        while time.monotonic() < deadline:
+        while True:
             self._ensure_not_stopped()
-            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
-            self._pump_serial(min(120, remaining_ms))
             result = evaluate_match(self._buffer, step)
             if step.match_mode == "none":
                 if result.matched_patterns:
@@ -380,8 +385,11 @@ class VerifyWorker(QObject):
             elif result.satisfied:
                 self._emit_log("匹配成功：" + ", ".join(result.matched_patterns))
                 return
+            remaining_ms = (deadline - time.monotonic()) * 1000
+            if remaining_ms <= 0:
+                break
+            self._pump_serial(min(120, max(1, int(remaining_ms))))
 
-        result = evaluate_match(self._buffer, step)
         if step.match_mode == "none":
             self._emit_log("检查通过：未命中禁止字段")
             return
@@ -394,11 +402,9 @@ class VerifyWorker(QObject):
             f"开始读取参数（{step.match_mode}/{step.match_type}, {step.timeout_ms} ms）：{', '.join(names)}"
         )
         deadline = time.monotonic() + step.timeout_ms / 1000.0
-        while time.monotonic() < deadline:
+        missing = names
+        while True:
             self._ensure_not_stopped()
-            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
-            self._pump_serial(min(120, remaining_ms))
-
             captured: dict[str, str] = {}
             missing: list[str] = []
             for pattern in step.patterns:
@@ -408,12 +414,16 @@ class VerifyWorker(QObject):
                 else:
                     captured[pattern.name or pattern.pattern] = value
 
-            if step.match_mode == "all" and len(captured) == len(step.patterns):
+            if step.match_mode == "all" and not missing:
                 self._store_captured_values(captured)
                 return
             if step.match_mode == "any" and captured:
                 self._store_captured_values(captured)
                 return
+            remaining_ms = (deadline - time.monotonic()) * 1000
+            if remaining_ms <= 0:
+                break
+            self._pump_serial(min(120, max(1, int(remaining_ms))))
 
         if step.match_mode == "any":
             raise RuntimeError("超时未读取到任何参数")
@@ -456,17 +466,15 @@ class VerifyWorker(QObject):
                 return None
             match = matches[-1]
             if pattern.name and pattern.name in match.groupdict():
-                named_value = match.groupdict().get(pattern.name)
-                if named_value is not None:
-                    return str(named_value)
+                return match.group(pattern.name)
             try:
                 if pattern.group == 0:
-                    return str(match.group(0))
-                return str(match.group(pattern.group))
+                    return match.group(0)
+                return match.group(pattern.group)
             except (IndexError, KeyError):
                 if match.lastindex:
-                    return str(match.group(1))
-                return str(match.group(0))
+                    return match.group(1)
+                return match.group(0)
 
         haystack = self._buffer if step.case_sensitive else self._buffer.lower()
         needle = pattern.pattern if step.case_sensitive else pattern.pattern.lower()
@@ -556,17 +564,24 @@ class VerifyWorker(QObject):
         if self._serial is None:
             return False
         try:
-            waiting = max(1, self._serial.in_waiting)
+            waiting = min(4096, self._serial.in_waiting)
+            if waiting <= 0:
+                return False
             raw = self._serial.read(waiting)
         except serial.SerialException as exc:
             raise RuntimeError(f"读取串口失败：{exc}") from exc
         if not raw:
             return False
-        text = raw.decode(self._profile.serial.encoding, errors="replace")
+        text = self._decoder.decode(raw, final=False)
         self._append_serial_text(text)
         return True
 
     def _append_serial_text(self, text: str) -> None:
+        if not text:
+            return
+        if self._last_was_cr and text.startswith("\n"):
+            text = text[1:]
+        self._last_was_cr = text.endswith("\r")
         normalized = text.replace("\r\n", "\n").replace("\r", "\n")
         self._buffer += normalized
         max_chars = self._profile.serial.max_buffer_chars
@@ -579,6 +594,9 @@ class VerifyWorker(QObject):
         for line in lines:
             if line:
                 self.log_message.emit(f"[串口] {line}")
+        while len(self._line_buffer) > max_chars:
+            self.log_message.emit(f"[串口] {self._line_buffer[:max_chars]}")
+            self._line_buffer = self._line_buffer[max_chars:]
 
     def _flush_line_buffer(self) -> None:
         if self._line_buffer:
@@ -588,6 +606,8 @@ class VerifyWorker(QObject):
     def _clear_buffer(self, log_message: str | None) -> None:
         self._buffer = ""
         self._line_buffer = ""
+        self._decoder.reset()
+        self._last_was_cr = False
         if self._serial is not None:
             try:
                 self._serial.reset_input_buffer()
@@ -1137,6 +1157,9 @@ class VerifyWidget(QWidget):
 
     def _load_profiles_from_default_sources(self) -> None:
         config_path = TOOL_DIR / "config.yaml"
+        if not config_path.is_file():
+            # Keep external overrides compatible while loading the bundled default in onefile mode.
+            config_path = _resource_root() / "config.yaml"
         if config_path.is_file():
             try:
                 self._profiles = load_verify_profiles_from_text(
@@ -1289,8 +1312,7 @@ class VerifyWidget(QWidget):
             else:
                 text = self._plan_edit.toPlainText().strip()
                 if not text:
-                    QMessageBox.warning(self, "提示", "当前检验脚本为空。")
-                    return None
+                    raise ValueError("当前检验脚本为空。")
                 profile = load_single_profile_from_text(profile_name, text)
                 self._visual_editor.load_profile(profile)
         except Exception as exc:  # noqa: BLE001
@@ -1321,7 +1343,9 @@ class VerifyWidget(QWidget):
     def _set_yaml_from_profile(self, profile: VerifyProfile) -> None:
         self._updating_editor_views = True
         try:
-            self._plan_edit.setPlainText(profile_to_yaml_text(profile))
+            text = profile_to_yaml_text(profile)
+            if text != self._plan_edit.toPlainText():
+                self._plan_edit.setPlainText(text)
         finally:
             self._updating_editor_views = False
 
@@ -1402,10 +1426,11 @@ class VerifyWidget(QWidget):
             task = self._find_task(port)
             if task is None:
                 continue
-            if task.state == VerifyTaskState.RUNNING and task.worker is not None:
-                task.error_message = "设备已断开，等待任务退出"
-                task.worker.request_stop()
-                self._append_log(f"{port} 已断开（任务中）")
+            if task.worker is not None or task.thread is not None:
+                if task.worker is not None:
+                    task.error_message = "设备已断开，等待任务退出"
+                    task.worker.request_stop()
+                    self._append_log(f"{port} 已断开（任务中）")
             else:
                 self._tasks.remove(task)
                 self._append_log(f"{port} 已断开，已移除")
@@ -1541,7 +1566,10 @@ class VerifyWidget(QWidget):
         return " / ".join(parts)
 
     def _start_task(self, task: VerifyTaskItem, profile: VerifyProfile | None = None) -> None:
-        if task.worker is not None:
+        if task.worker is not None or task.thread is not None:
+            return
+        if self.active_task_count() >= self.MAX_CONCURRENT:
+            self._append_log("当前校验并发已满，请等待正在执行的任务结束。")
             return
         active_profile = profile or self._validate_current_profile(show_message=False)
         if active_profile is None:
@@ -1577,7 +1605,7 @@ class VerifyWidget(QWidget):
         worker.step_changed.connect(lambda step, t=task: self._on_task_step_changed(t, step))
         worker.result_changed.connect(lambda text, values, t=task: self._on_task_result_changed(t, text, values))
         worker.finished.connect(lambda outcome, summary, t=task: self._on_task_finished(t, outcome, summary))
-        worker.finished.connect(thread.quit)
+        worker.finished.connect(thread.quit, Qt.ConnectionType.DirectConnection)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(lambda t=task, th=thread: self._on_task_thread_finished(t, th))
         thread.finished.connect(thread.deleteLater)
@@ -1598,7 +1626,7 @@ class VerifyWidget(QWidget):
             QMessageBox.information(self, "提示", "请先勾选至少一台设备。")
             return
         for task in self._tasks:
-            if task.selected and task.worker is None and task.state != VerifyTaskState.RUNNING:
+            if task.selected and task.worker is None and task.thread is None and task.state != VerifyTaskState.RUNNING:
                 task.state = VerifyTaskState.WAITING
                 task.current_step = "-"
         self._run_all_requested = True
@@ -1618,9 +1646,14 @@ class VerifyWidget(QWidget):
         for task in self._tasks:
             if task.selected and task.worker is not None:
                 self._abort_task(task)
+            elif task.selected and task.state == VerifyTaskState.WAITING:
+                task.state = VerifyTaskState.STOPPED
+                task.current_step = "-"
+                task.result_summary = "用户停止"
+        self._refresh_dev_table()
 
     def _schedule_next(self) -> None:
-        running = sum(task.state == VerifyTaskState.RUNNING for task in self._tasks)
+        running = self.active_task_count()
         if running >= self.MAX_CONCURRENT:
             return
 
@@ -1633,11 +1666,10 @@ class VerifyWidget(QWidget):
                     task.port in self._batch_ports
                     and task.state == VerifyTaskState.WAITING
                     and task.worker is None
+                    and task.thread is None
                 ):
                     self._start_task(task, profile=profile)
-                    running = sum(
-                        item.state == VerifyTaskState.RUNNING for item in self._tasks
-                    )
+                    running = self.active_task_count()
             if not any(
                 task.port in self._batch_ports and task.state == VerifyTaskState.WAITING
                 for task in self._tasks
@@ -1648,17 +1680,21 @@ class VerifyWidget(QWidget):
             return
 
         if self._auto_mode:
+            if not any(
+                task.selected and task.state == VerifyTaskState.WAITING
+                and task.worker is None and task.thread is None
+                for task in self._tasks
+            ):
+                return
             profile = self._validate_current_profile(show_message=False)
             if profile is None:
                 return
             for task in self._tasks:
                 if running >= self.MAX_CONCURRENT:
                     break
-                if task.selected and task.state == VerifyTaskState.WAITING and task.worker is None:
+                if task.selected and task.state == VerifyTaskState.WAITING and task.worker is None and task.thread is None:
                     self._start_task(task, profile=profile)
-                    running = sum(
-                        item.state == VerifyTaskState.RUNNING for item in self._tasks
-                    )
+                    running = self.active_task_count()
 
     def _on_task_step_changed(self, task: VerifyTaskItem, step_text: str) -> None:
         task.current_step = step_text
@@ -1701,9 +1737,12 @@ class VerifyWidget(QWidget):
         if task.thread is not thread:
             return
         task.thread = None
+        task.worker = None
         if task.port_lease is not None:
             task.port_lease.release()
             task.port_lease = None
+        if self._auto_mode or self._run_all_requested:
+            QTimer.singleShot(0, self._schedule_next)
 
     def _abort_task(self, task: VerifyTaskItem) -> None:
         if task.worker is None:
@@ -1715,7 +1754,9 @@ class VerifyWidget(QWidget):
 
     def _clear_done(self) -> None:
         self._tasks = [
-            task for task in self._tasks if task.state in {VerifyTaskState.WAITING, VerifyTaskState.RUNNING}
+            task for task in self._tasks
+            if task.state in {VerifyTaskState.WAITING, VerifyTaskState.RUNNING}
+            or task.worker is not None or task.thread is not None
         ]
         self._refresh_dev_table()
 

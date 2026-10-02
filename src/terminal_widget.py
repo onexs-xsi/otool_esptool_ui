@@ -200,12 +200,22 @@ class TerminalSerialThread(QThread):
 
     def _drain_send_queue(self) -> None:
         assert self._serial is not None
-        while True:
+        # Bound each pass so continuous TX cannot starve RX or disconnect.
+        for _ in range(64):
+            if self._stop_event.is_set():
+                break
             try:
                 data = self._send_queue.get_nowait()
             except queue.Empty:
                 break
-            self._serial.write(data)
+            written = 0
+            while written < len(data) and not self._stop_event.is_set():
+                count = self._serial.write(data[written:])
+                if count is None or count <= 0:
+                    raise serial.SerialTimeoutException("串口写入未取得进展")
+                written += count
+            if self._stop_event.is_set():
+                break
             self._serial.flush()
 
     def _close_serial(self) -> None:
@@ -869,7 +879,8 @@ class TerminalWidget(QWidget):
             if session.serial_thread is not None:
                 return
             self._update_session_config(session, config)
-            self._activate_session(session_id)
+            if session_id == self._active_session_id:
+                self._activate_session(session_id)
         else:
             session_id = self._ensure_session_for_config(config)
             session = self._sessions[session_id]
@@ -890,7 +901,6 @@ class TerminalWidget(QWidget):
             )
             return
         session.port_lease = lease
-        self._set_status("连接中", "idle")
         self._set_session_status(session_id, "连接中")
         self._append_sys(
             f"正在连接 {config.port} @ {config.baudrate}, "

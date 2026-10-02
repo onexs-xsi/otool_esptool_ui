@@ -25,6 +25,7 @@ $Script:VenvDir          = Join-Path $Script:ProjectRoot '.venv'
 $Script:VenvPython       = Join-Path $Script:VenvDir 'Scripts\python.exe'
 $Script:MainScript       = Join-Path $Script:ProjectRoot 'otool_esptool_ui.py'
 $Script:RequirementsFile = Join-Path $Script:ProjectRoot 'requirements.txt'
+$Script:BuildRequirementsFile = Join-Path $Script:ProjectRoot 'requirements-build.txt'
 $Script:SpecFile         = Join-Path $Script:ProjectRoot 'otool_esptool_ui.spec'
 $Script:PackageOutput    = Join-Path $Script:ProjectRoot 'dist\otool_esptool_ui.exe'
 $Script:EsptoolDir       = Join-Path $Script:ProjectRoot 'esptool'
@@ -223,7 +224,7 @@ function Ensure-EnvironmentPrerequisites {
 function Ensure-PackagePrerequisites {
     Ensure-EnvironmentPrerequisites
     if (-not (Test-Path $Script:SpecFile))   { throw "Missing: $Script:SpecFile" }
-    if (-not (Test-Path $Script:EsptoolDir)) { throw "Missing esptool. Run: git submodule update --init --recursive" }
+    if (-not (Test-Path -LiteralPath $Script:BuildRequirementsFile)) { throw "Missing: $Script:BuildRequirementsFile" }
 }
 
 # ─── Core actions ─────────────────────────────────────────────────
@@ -273,8 +274,8 @@ function Initialize-Environment {
 
     if (-not $SkipPipUpgrade) {
         Invoke-CheckedExternal -FilePath $Script:VenvPython `
-            -Arguments @('-m', 'pip', 'install', '--upgrade', 'pip') `
-            -Description 'Upgrading pip'
+            -Arguments @('-m', 'pip', 'install', '--upgrade', 'pip==26.2.1') `
+            -Description 'Installing release pip version'
     }
 
     if (-not $SkipRequirementInstall) {
@@ -300,14 +301,43 @@ function Start-AppProcess {
 function Test-PackagedToolDispatch {
     param([Parameter(Mandatory = $true)] [string]$ExecutablePath)
 
-    foreach ($toolName in @('espefuse.py', 'espsecure.py')) {
+    foreach ($toolName in @('esptool', 'espefuse', 'espsecure')) {
         Write-Step "Smoke-testing frozen dispatcher: $toolName --help"
         $process = Start-Process -FilePath $ExecutablePath `
             -ArgumentList @($toolName, '--help') `
             -WorkingDirectory $Script:ProjectRoot `
-            -WindowStyle Hidden -PassThru -Wait
+            -WindowStyle Hidden -PassThru
+        try {
+            if (-not $process.WaitForExit(30000)) { throw "Frozen dispatcher timed out: $toolName" }
+            if ($process.ExitCode -ne 0) {
+                throw "Frozen dispatcher smoke test failed: $toolName (exit $($process.ExitCode))"
+            }
+        }
+        finally {
+            if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
+        }
+    }
+}
+
+function Test-PackagedQtStartup {
+    param([Parameter(Mandatory = $true)] [string]$ExecutablePath)
+
+    Write-Step 'Smoke-testing frozen Qt startup'
+    $process = Start-Process -FilePath $ExecutablePath `
+        -ArgumentList @('__otool_qt_startup_smoke__') `
+        -WorkingDirectory $Script:ProjectRoot `
+        -WindowStyle Hidden -PassThru
+    try {
+        if (-not $process.WaitForExit(30000)) {
+            throw 'Frozen Qt startup smoke test timed out.'
+        }
         if ($process.ExitCode -ne 0) {
-            throw "Frozen dispatcher smoke test failed: $toolName (exit $($process.ExitCode))"
+            throw "Frozen Qt startup smoke test failed (exit $($process.ExitCode))"
+        }
+    }
+    finally {
+        if (-not $process.HasExited) {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
         }
     }
 }
@@ -329,8 +359,16 @@ function Build-Package {
         -SkipRequirementInstall:$SkipRequirementInstall
 
     Invoke-CheckedExternal -FilePath $Script:VenvPython `
-        -Arguments @('-m', 'pip', 'install', 'pyinstaller') `
-        -Description 'Installing PyInstaller'
+        -Arguments @('-m', 'pip', 'install', '-r', $Script:BuildRequirementsFile) `
+        -Description 'Installing locked release build requirements'
+    Invoke-CheckedExternal -FilePath $Script:VenvPython `
+        -Arguments @('-m', 'pip', 'check') -Description 'Checking dependency consistency'
+    Push-Location -LiteralPath $Script:ProjectRoot
+    try {
+        Invoke-CheckedExternal -FilePath $Script:VenvPython `
+            -Arguments @('-m', 'src.build_safety') -Description 'Checking release versions and locked backend'
+    }
+    finally { Pop-Location }
 
     $pyiArgs = @('-m', 'PyInstaller')
     if (-not $DisableCleanBuild) { $pyiArgs += '--clean' }
@@ -339,6 +377,7 @@ function Build-Package {
     Invoke-CheckedExternal -FilePath $Script:VenvPython -Arguments $pyiArgs -Description 'Running PyInstaller'
 
     if (-not (Test-Path $Script:PackageOutput)) { throw "Package not found: $Script:PackageOutput" }
+    Test-PackagedQtStartup -ExecutablePath $Script:PackageOutput
     Test-PackagedToolDispatch -ExecutablePath $Script:PackageOutput
     Write-Step "Package ready: $Script:PackageOutput"
 }

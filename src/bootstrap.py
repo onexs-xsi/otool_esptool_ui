@@ -65,6 +65,12 @@ def dispatch_internal_worker() -> None:
     if len(sys.argv) < 3 or sys.argv[1] != _INTERNAL_WORKER_MARKER:
         return
 
+    # The parent consumes JSON lines. Use a fixed wire encoding regardless of
+    # the Windows code page (including when redirected by QProcess).
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     if not getattr(sys, "frozen", False) and _local_esptool_available():
         local_root = str(LOCAL_ESPTOOL_DIR)
         if local_root not in sys.path:
@@ -83,9 +89,10 @@ def dispatch_internal_worker() -> None:
     from esptool.util import FatalError as EsptoolFatalError
 
     class WorkerLogger(TemplateLogger):
-        # NOTE: set_logger() uses __class__ reassignment, not instance copy.
-        # __init__ runs on a throwaway instance, not on `log` itself.
-        # _line_buffer is initialized on `log` after set_logger() below.
+        # esptool 5.4 wraps this instance in an esp-pylib adapter. Keep state
+        # on the instance, never on the shared upstream logger proxy.
+        def __init__(self) -> None:
+            self._line_buffer = ""
 
         def _emit_log_line(self, text: str, level: str = "info") -> None:
             emit_worker_event({"type": "log", "level": level, "text": text})
@@ -106,7 +113,7 @@ def dispatch_internal_worker() -> None:
                 self._line_buffer = ""
 
         def print(self, *args, **kwargs):
-            self._feed("".join(map(str, args)), kwargs.get("end", "\n"), "info")
+            self._feed(kwargs.get("sep", " ").join(map(str, args)), kwargs.get("end", "\n"), "info")
 
         def note(self, message: str):
             self._feed(f"Note: {message}", "\n", "note")
@@ -146,8 +153,8 @@ def dispatch_internal_worker() -> None:
         def set_verbosity(self, verbosity: str):
             emit_worker_event({"type": "verbosity", "value": verbosity})
 
-    esptool_log.set_logger(WorkerLogger())
-    esptool_log._line_buffer = ""
+    worker_logger = WorkerLogger()
+    esptool_log.set_logger(worker_logger)
 
     tool_name = sys.argv[2]
     tool_args = sys.argv[3:]
@@ -187,8 +194,7 @@ def dispatch_internal_worker() -> None:
         )
         exit_code = 1
     finally:
-        if hasattr(esptool_log, "flush_pending"):
-            esptool_log.flush_pending()
+        worker_logger.flush_pending()
         sys.stdout.flush()
     # Use os._exit() instead of sys.exit() to avoid blocking on non-daemon threads
     # that serial / USB libraries may leave running after the flash completes.

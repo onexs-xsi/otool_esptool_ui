@@ -1,4 +1,4 @@
-"""OTool Esptool UI — ESP 多设备烧录工具
+"""OTool Esptool UI — ESP 烧录、eFuse、校验、固件分合与串口终端工作台
 
 Entry point for direct script execution and worker subprocess re-invocation.
 
@@ -8,7 +8,9 @@ For package usage::
     otool_esptool_ui.main()
 """
 
-__version__ = "0.6.11"
+import sys
+
+__version__ = "0.6.15"
 __author__ = "ONEXS"
 __title__ = "OTool Esptool UI | byonexs."
 
@@ -28,7 +30,20 @@ configure_qt_dll_path()
 
 # ── Application entry ────────────────────────────────────────────────────────
 
-from src.main_window import main  # noqa: E402
+_QT_STARTUP_SMOKE_ARG = "__otool_qt_startup_smoke__"
+_qt_startup_smoke = (
+    getattr(sys, "frozen", False) and sys.argv[1:] == [_QT_STARTUP_SMOKE_ARG]
+)
+
+try:
+    from src.main_window import main  # noqa: E402
+except Exception:
+    if _qt_startup_smoke:
+        raise SystemExit(1) from None
+    raise
+
+if _qt_startup_smoke:
+    raise SystemExit(0)
 
 if __name__ == "__main__":
     raise SystemExit(main())

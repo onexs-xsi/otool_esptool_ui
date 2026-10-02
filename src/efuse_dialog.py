@@ -1,7 +1,7 @@
 import json
 import re
 
-from PyQt6.QtCore import QProcess, QProcessEnvironment, Qt
+from PyQt6.QtCore import QProcess, QProcessEnvironment, Qt, QSize
 from PyQt6.QtGui import QFont, QTextCursor
 from PyQt6.QtWidgets import (
     QDialog,
@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -35,8 +36,8 @@ from .models import DeviceInfo
 class EFuseDialog(QDialog):
     """Per-device eFuse read (table) / burn dialog."""
 
-    # 按芯片型号分组的快捷预设；从 config.yaml 加载，格式：{chip_key: [(label, name, value), ...]}
-    CHIP_PRESETS: dict[str, list[tuple[str, str, str]]] = EFUSE_CHIP_PRESETS
+    # 按芯片型号分组；每项为 (label, name, value, description)。
+    CHIP_PRESETS: dict[str, list[tuple[str, str, str, str]]] = EFUSE_CHIP_PRESETS
 
     def __init__(
         self,
@@ -60,11 +61,20 @@ class EFuseDialog(QDialog):
         self.resize(920, 680)
         self._init_ui()
         self._apply_style()
+        self.resize(self.size().boundedTo(self.screen().availableGeometry().size() - QSize(24, 48)))
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
     def _init_ui(self) -> None:
-        root = QVBoxLayout(self)
+        content = QWidget()
+        root = QVBoxLayout(content)
+        self._content_scroll = QScrollArea(self)
+        self._content_scroll.setWidgetResizable(True)
+        self._content_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._content_scroll.setWidget(content)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(self._content_scroll)
         root.setContentsMargins(16, 14, 16, 14)
         root.setSpacing(10)
 
@@ -230,7 +240,7 @@ class EFuseDialog(QDialog):
         if v.startswith("0b") and set(v[2:]) <= {"0"}:
             return False
         # all-zero byte arrays like "00 00 00 ..."
-        if re.match(r"^(00 )*00$", v):
+        if re.fullmatch(r"00(?:[:.\-\s]+00)*", v):
             return False
         return True
 
@@ -249,12 +259,14 @@ class EFuseDialog(QDialog):
             data = json.loads(text[start:end])
         except json.JSONDecodeError:
             return []
+        if not isinstance(data, dict):
+            return []
         results: list[tuple[str, str, str, bool, bool]] = []
         for name, info in data.items():
             if not isinstance(info, dict):
                 continue
             raw = info.get("value")
-            display = str(raw) if raw is not None else "0"
+            display = str(raw) if raw is not None else "未知"
             desc = str(info.get("description", ""))
             readable = bool(info.get("readable", True))
             writeable = bool(info.get("writeable", True))
@@ -309,7 +321,8 @@ class EFuseDialog(QDialog):
 
         filtered: list[tuple[str, str, str, bool, bool, bool]] = []
         for name, value, desc, readable, writeable in rows:
-            burned = self._is_burned(value)
+            known = readable and value.strip().lower() not in ("", "未知", "none", "?")
+            burned = known and self._is_burned(value)
             if only_burned and not burned:
                 continue
             if query and query not in name.lower() and query not in desc.lower():
@@ -322,7 +335,8 @@ class EFuseDialog(QDialog):
             self.table.setCellWidget(
                 row, 0,
                 self._make_badge_cell(
-                    "● 已熔丝" if burned else "○ 未熔丝",
+                    "— 未知" if not readable or value.strip().lower() in ("", "未知", "none", "?")
+                    else "● 已熔丝" if burned else "○ 未熔丝",
                     "burnedBadge" if burned else "unburnedBadge",
                 )
             )
@@ -360,6 +374,8 @@ class EFuseDialog(QDialog):
         )
 
     def _on_row_double_clicked(self, row: int, _col: int) -> None:
+        if self.process is not None:
+            return
         item = self.table.item(row, 2)   # col 2 = 字段名
         if item:
             self.efuse_name_edit.setText(item.text())
@@ -368,6 +384,8 @@ class EFuseDialog(QDialog):
             self.efuse_value_edit.selectAll()
 
     def _apply_preset(self, name: str, value: str) -> None:
+        if self.process is not None:
+            return
         self.efuse_name_edit.setText(name)
         self.efuse_value_edit.setText(value)
 
@@ -407,22 +425,36 @@ class EFuseDialog(QDialog):
         env = QProcessEnvironment.systemEnvironment()
         _inject_local_esptool_pythonpath(env)
         process.setProcessEnvironment(env)
-        process.readyReadStandardOutput.connect(lambda l=log: self._on_output(l))
-        process.finished.connect(self._on_finished)
+        process.readyReadStandardOutput.connect(
+            lambda l=log, p=process: self._on_output(l, p)
+        )
+        process.finished.connect(
+            lambda code, status, p=process: self._on_finished(code, status, p)
+        )
         self._set_busy(True)
         process.start()
         if not process.waitForStarted(3000):
+            if self.process is not process:
+                return
             msg = "进程启动失败，请检查 espefuse 调用环境。"
             self.burn_log.appendPlainText(msg)
             self.row_count_lbl.setText("启动失败")
             self.process = None
+            process.blockSignals(True)
+            process.kill()
+            process.deleteLater()
             self._is_reading = False
             self._set_busy(False)
 
-    def _on_output(self, log: QPlainTextEdit | None) -> None:
-        if self.process is None:
+    def _on_output(
+        self, log: QPlainTextEdit | None, process: QProcess | None = None
+    ) -> None:
+        process = process if process is not None else self.process
+        if process is None or self.process is not process:
             return
-        data = decode_process_output(bytes(self.process.readAllStandardOutput()))
+        data = decode_process_output(bytes(process.readAllStandardOutput()))
+        if not data:
+            return
         if self._is_reading:
             self._read_buf.append(data)
         if log is not None:
@@ -431,33 +463,44 @@ class EFuseDialog(QDialog):
             c.movePosition(QTextCursor.MoveOperation.End)
             log.setTextCursor(c)
 
-    def _on_finished(self, exit_code: int, _) -> None:
+    def _on_finished(self, exit_code: int, _, process: QProcess | None = None) -> None:
+        process = process if process is not None else self.process
+        if process is None or self.process is not process:
+            return
+        self._on_output(self.burn_log, process)
         if self._is_reading:
             full_text = "".join(self._read_buf)
             rows = self._parse_summary_json(full_text)
             if not rows:
                 rows = self._parse_summary_text(full_text)
-            self._populate_table(rows)
+            self._populate_table(rows if exit_code == 0 else [])
             self._is_reading = False
             if exit_code != 0:
                 self.burn_log.appendPlainText(f"[读取失败，退出码: {exit_code}]")
-                if not rows:
-                    self.row_count_lbl.setText(f"读取失败（退出码 {exit_code}），请检查串口连接")
+                self.row_count_lbl.setText(f"读取失败（退出码 {exit_code}），请检查串口连接")
+            elif not rows:
+                self.row_count_lbl.setText("未读取到有效 eFuse 数据，请检查日志")
         else:
-            self.burn_log.appendPlainText(f"[完成，退出码: {exit_code}]")
-        if self.process:
-            self.process.deleteLater()
-            self.process = None
+            self.burn_log.appendPlainText(
+                "[烧写命令完成，请读取 eFuse 核验结果]" if exit_code == 0
+                else f"[烧写失败，退出码: {exit_code}，请重新读取并核验设备状态]"
+            )
+        self.process = None
+        process.deleteLater()
         self._set_busy(False)
 
     def _set_busy(self, busy: bool) -> None:
         self.read_btn.setEnabled(not busy)
         self.stop_read_btn.setEnabled(busy and self._is_reading)
         self.burn_btn.setEnabled(not busy)
+        self.efuse_name_edit.setEnabled(not busy)
+        self.efuse_value_edit.setEnabled(not busy)
         # OTP writes are never exposed as killable operations.
         self.stop_burn_btn.setEnabled(False)
 
     def _burn_efuse(self) -> None:
+        if self.process is not None:
+            return
         name = self.efuse_name_edit.text().strip()
         value = self.efuse_value_edit.text().strip()
         if not name or not value:
@@ -485,9 +528,15 @@ class EFuseDialog(QDialog):
             )
             return
         if self.process:
-            self.process.kill()
-            self.process.deleteLater()
+            process = self.process
+            # Invalidate before kill: queued completion from this read must
+            # not clear or append output to a subsequent operation.
             self.process = None
+            process.blockSignals(True)
+            process.kill()
+            process.waitForFinished(500)
+            process.deleteLater()
+            self.row_count_lbl.setText("读取已停止")
         self._is_reading = False
         self._set_busy(False)
 
@@ -589,3 +638,15 @@ class EFuseDialog(QDialog):
             return
         self._stop_process()
         super().closeEvent(event)
+
+    def reject(self) -> None:
+        # QDialog handles Esc through reject(), bypassing closeEvent().
+        if self.process is not None and not self._is_reading:
+            QMessageBox.warning(
+                self,
+                "烧写进行中",
+                "请等待 eFuse 烧写完成并核验结果后再关闭。",
+            )
+            return
+        self._stop_process()
+        super().reject()

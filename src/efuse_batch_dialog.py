@@ -560,6 +560,19 @@ class BurnEfuseBatchWidget(QWidget):
         return [c for c in self._field_configs if c.enabled and c.name and c.value]
 
     def _capture_run_config(self) -> EfuseRunConfig | None:
+        incomplete_rows = [
+            str(index + 1)
+            for index, field in enumerate(self._field_configs)
+            if field.enabled and (not field.name.strip() or not field.value.strip())
+        ]
+        if incomplete_rows:
+            QMessageBox.warning(
+                self,
+                "字段配置错误",
+                "已启用的字段尚未填写完整（第 " + ", ".join(incomplete_rows)
+                + " 行），请填写字段名和值，或取消启用。",
+            )
+            return None
         fields = self._get_enabled_fields()
         if not fields:
             QMessageBox.warning(self, "提示", "请至少配置一个已启用的 eFuse 字段。")
@@ -578,12 +591,13 @@ class BurnEfuseBatchWidget(QWidget):
             return None
 
         baud = self._baud_combo.currentText().strip()
-        if not baud.isdigit():
-            QMessageBox.warning(self, "字段配置错误", "波特率必须是数字。")
+        if not baud.isascii() or not baud.isdigit() or int(baud) <= 0:
+            QMessageBox.warning(self, "字段配置错误", "波特率必须是正整数。")
             return None
         chip = self._chip_combo.currentText().strip() or "auto"
         targets = tuple(
-            EfuseTarget(field.name, field.value, field.description) for field in fields
+            EfuseTarget(field.name.strip().upper(), field.value.strip(), field.description)
+            for field in fields
         )
         return EfuseRunConfig(fields=targets, chip=chip, baud=baud)
 
@@ -1626,7 +1640,7 @@ class BurnEfuseBatchWidget(QWidget):
                 process,
                 process_token,
                 code,
-                "".join(buf),
+                "".join(buf) + decode_process_output(bytes(process.readAllStandardOutput())),
                 on_finished,
             )
         )

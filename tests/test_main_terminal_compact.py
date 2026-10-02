@@ -35,6 +35,7 @@ class MainTerminalCompactTests(unittest.TestCase):
             self.assertTrue(window._toolbar.isHidden())
             self.assertTrue(window.floating_tab_panel.isHidden())
             self.assertTrue(window.floating_info_panel.isHidden())
+            self.assertTrue(window._footer.isHidden())
             self.assertEqual(window.page_stack.currentIndex(), 4)
             self.assertEqual(window._terminal_page_layout.contentsMargins().bottom(), 0)
             self.assertFalse(terminal._serial_config_widget.isHidden())
@@ -46,7 +47,7 @@ class MainTerminalCompactTests(unittest.TestCase):
             self.assertFalse(window._toolbar.isHidden())
             self.assertFalse(window.floating_tab_panel.isHidden())
             self.assertFalse(window.floating_info_panel.isHidden())
-            self.assertEqual(window._terminal_page_layout.contentsMargins().bottom(), 70)
+            self.assertFalse(window._footer.isHidden())
 
         window.close()
         window.deleteLater()

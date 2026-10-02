@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "otool-esptool-ui"
-version = "0.6.11"
-description = "PyQt6 GUI for mass-detecting and flashing ESP devices with esptool"
+version = "0.6.15"
+description = "Windows ESP workbench for flashing, eFuse, serial verification, firmware images and terminals"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{name = "ONEXS"}]
@@ -18,18 +18,28 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "PyQt6>=6.0.0",
-    "esptool==5.3.1",
-    "bitstring>=3.1.6,!=4.2.0",
-    "cryptography>=43.0.0",
-    "pyserial>=3.3",
+    "PyQt6==6.11.0",
+    "esptool==5.4.0",
+    "littlefs-python==0.19.0",
+    "bitstring==4.4.0",
+    "cryptography==50.0.2",
+    "pyserial==3.5",
     "pyte==0.8.2",
-    "wcwidth==0.8.2",
-    "reedsolo>=1.5.3,<1.8",
-    "PyYAML>=5.1",
-    "intelhex",
-    "rich_click<2",
-    "click<9",
+    "wcwidth==0.9.1",
+    "reedsolo==1.7.0",
+    "PyYAML==6.0.3",
+    "intelhex==2.3.0",
+    "rich-click==1.9.9",
+    "click==8.5.0",
+    "esp-pylib[cli,ide,serial]==1.1.5",
+]
+
+[project.optional-dependencies]
+build = [
+    "PyInstaller==6.22.3",
+    "pyinstaller-hooks-contrib==2026.8",
+    "setuptools==84.0.0",
+    "pip==26.2.1",
 ]
 
 [project.scripts]

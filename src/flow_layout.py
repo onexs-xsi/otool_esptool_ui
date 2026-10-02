@@ -55,12 +55,12 @@ class FlowLayout(QLayout):
         line_height = 0
         for item in self._items:
             w = item.widget()
-            if w is not None and not w.isVisible():
+            if w is not None and w.isHidden():
                 continue
             hint = item.sizeHint()
             iw, ih = hint.width(), hint.height()
             next_x = x + iw + self._h_spacing
-            if next_x - self._h_spacing > eff.right() and line_height > 0:
+            if next_x - self._h_spacing > eff.x() + eff.width() and line_height > 0:
                 x = eff.x()
                 y += line_height + self._v_spacing
                 next_x = x + iw + self._h_spacing

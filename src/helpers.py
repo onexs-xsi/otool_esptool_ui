@@ -83,13 +83,17 @@ def _fetch_remote_avatar_bytes(on_success: Callable[[bytes], None]) -> None:
     """Download avatar in a daemon thread; call *on_success(bytes)* on success.
 
     The callback is invoked from the background thread — callers must
-    marshal to the main thread (e.g. via ``QTimer.singleShot``) before
-    touching any Qt widgets.
+    marshal to the main thread using a GUI-owned Qt signal before touching
+    widgets. A timer created in this Python thread has no Qt event loop.
     """
 
     def _worker() -> None:
         avatar_bytes = _download_github_avatar()
         if avatar_bytes:
-            on_success(avatar_bytes)
+            try:
+                on_success(avatar_bytes)
+            except (RuntimeError, AttributeError):
+                # The receiving Qt window may have been destroyed meanwhile.
+                pass
 
     threading.Thread(target=_worker, daemon=True).start()

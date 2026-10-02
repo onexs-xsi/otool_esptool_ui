@@ -8,6 +8,7 @@ from PyInstaller.utils.hooks import (
     collect_all,
     copy_metadata,
 )
+from src.build_safety import partition_root_icu_binaries
 
 TOOL_DIR = Path(SPECPATH)
 
@@ -55,6 +56,8 @@ _PACKAGES = [
     "serial",
     "pyte",
     "bitstring",
+    "esp_pylib",
+    "littlefs",
 ]
 
 # “引用说明”在冻结版中也需要读取实际构建版本。显式携带这些 dist-info，
@@ -74,6 +77,9 @@ _REFERENCE_DISTRIBUTIONS = [
     "intelhex",
     "rich-click",
     "click",
+    "esp-pylib",
+    "PyQt6-Qt6",
+    "pyinstaller-hooks-contrib",
 ]
 
 added_datas = []
@@ -198,6 +204,14 @@ a = Analysis(
     excludes=[],
     noarchive=False,
 )
+
+# Qt 6.11 uses the Windows ICU forwarder (icuuc.dll).  Do not let an unrelated
+# ICU implementation found on PATH (for example Poppler's ICU 78 runtime) be
+# copied to the archive root and shadow the compatible Windows system DLL.
+_kept_binaries, _excluded_root_icu = partition_root_icu_binaries(a.binaries)
+a.binaries[:] = _kept_binaries
+for _destination, _source, _typecode in _excluded_root_icu:
+    print(f"[spec] Excluding external root ICU binary: {_destination} <- {_source}")
 
 # Fail the build here instead of shipping an executable that crashes only
 # when the frozen espefuse/espsecure dispatcher is used.
