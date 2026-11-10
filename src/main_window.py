@@ -11,6 +11,7 @@ from PyQt6.QtCore import (
     QProcess,
     QProcessEnvironment,
     QPropertyAnimation,
+    QPoint,
     QRectF,
     QSize,
     Qt,
@@ -44,6 +45,7 @@ from PyQt6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QStackedWidget,
+    QSplitter,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
@@ -73,12 +75,26 @@ from .constants import (
 )
 from .dialog_memory import get_existing_directory, get_open_file_name
 from .device_card import DeviceCard
+from .chip_probe import ChipInfoProbe, chip_information
+from .auto_flash import (
+    AUTO_DETECT_TIMEOUT_ENV, AUTO_DETECT_TIMEOUT_SECONDS, AUTO_RETRY_DELAY_MS,
+    AUTO_REMOVAL_POLL_INTERVAL_MS, AutoFlashCycle,
+)
+from .device_policy import DeviceIdentity, DevicePolicyStore, canonical_port
 from .efuse_batch_dialog import BurnEfuseBatchWidget
 from .jump_list import setup_jump_list
 from .efuse_dialog import EFuseDialog
-from .esptool_commands import build_erase_flash_args, is_erase_flash_command, validate_flash_entries
+from .esptool_commands import build_erase_flash_args, is_erase_flash_command, resolve_existing_path, validate_flash_entries
+from .idf_build import BuildFlashConfig, load_idf_build
 from .export_dialog import ExportFlashDialog
 from .flow_layout import FlowLayout
+from .firmware_history import (
+    FirmwareHistoryStore, FirmwareSource, HISTORY_LABEL_MAX_CHARS,
+    HISTORY_LABEL_MAX_WIDTH, shorten_source_path,
+)
+from .flash_timing import FlashRunTimer, normalize_mac
+from .flash_history import FlashHistoryStore, HistoryPreferences
+from .flash_history_widget import FlashHistoryPanel
 from .helpers import _build_avatar_icon, _build_github_icon, _fetch_remote_avatar_bytes
 from .merge_split_widget import MergeSplitWidget
 from .models import DeviceInfo
@@ -359,11 +375,15 @@ class FlashEntryRow(QWidget):
     """单条烧录条目：地址 + 固件路径 + 浏览 + 移除。"""
 
     remove_requested = pyqtSignal()
+    build_import_requested = pyqtSignal(str)
+    firmware_used = pyqtSignal(str)
 
     def __init__(
-        self, addr: str = "0x0", path: str = "", parent: "QWidget | None" = None
+        self, addr: str = "0x0", path: str = "", parent: "QWidget | None" = None,
+        history: FirmwareHistoryStore | None = None,
     ) -> None:
         super().__init__(parent)
+        self._history = history if history is not None else FirmwareHistoryStore()
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 1, 0, 1)
         lay.setSpacing(6)
@@ -377,11 +397,17 @@ class FlashEntryRow(QWidget):
         path_lbl = QLabel("固件")
         path_lbl.setObjectName("configLabel")
         self.path_edit = QLineEdit(path)
-        self.path_edit.setPlaceholderText("选择待烧录的 .bin 固件文件")
+        self.path_edit.setPlaceholderText("选择 .bin 固件文件或 ESP-IDF build 目录")
+        self._accepted_path = path
+        self.path_edit.editingFinished.connect(self._finish_path_edit)
 
-        browse_btn = QPushButton("选择")
-        browse_btn.setFixedWidth(52)
-        browse_btn.clicked.connect(self._browse)
+        self.browse_btn = QPushButton("选择")
+        self.browse_btn.setFixedWidth(70)
+        self.browse_menu = QMenu(self.browse_btn)
+        self.browse_menu.setToolTipsVisible(True)
+        self.browse_menu.aboutToShow.connect(self._populate_browse_menu)
+        self.browse_btn.setMenu(self.browse_menu)
+        self._populate_browse_menu()
 
         self.remove_btn = QPushButton("✕")
         self.remove_btn.setObjectName("entryRemoveButton")
@@ -393,7 +419,7 @@ class FlashEntryRow(QWidget):
         lay.addSpacing(4)
         lay.addWidget(path_lbl)
         lay.addWidget(self.path_edit, 1)
-        lay.addWidget(browse_btn)
+        lay.addWidget(self.browse_btn)
         lay.addWidget(self.remove_btn)
 
     def _browse(self) -> None:
@@ -403,8 +429,69 @@ class FlashEntryRow(QWidget):
             "Binary Files (*.bin);;All Files (*.*)",
         )
         if file_path:
-            self.path_edit.setText(file_path)
-            self._auto_set_addr(file_path)
+            self.set_firmware_path(file_path, auto_address=True)
+            self.firmware_used.emit(file_path)
+
+    def _populate_browse_menu(self) -> None:
+        menu = self.browse_menu
+        menu.clear()
+        menu.addAction("选择 bin 文件", self._browse)
+        menu.addAction("导入 build 目录", self._browse_build)
+        menu.addSeparator()
+        if not self._history.entries:
+            action = menu.addAction("暂无使用记录")
+            action.setEnabled(False)
+            if self._history.load_error:
+                action.setToolTip(f"历史记录读取失败：{self._history.load_error}")
+            return
+        metrics = menu.fontMetrics()
+        for source in self._history.entries:
+            prefix = "build · " if source.kind == "build" else "bin · "
+            limit = HISTORY_LABEL_MAX_CHARS
+            text = prefix + shorten_source_path(source, limit)
+            while limit > 12 and metrics.horizontalAdvance(text) > HISTORY_LABEL_MAX_WIDTH:
+                limit -= 1
+                text = prefix + shorten_source_path(source, limit)
+            action = menu.addAction(text.replace("&", "&&"))
+            action.setData({"kind": source.kind, "path": source.path})
+            action.setToolTip(source.path if source.available else f"{source.path}\n路径已不存在，请重新选择。")
+            action.setEnabled(source.available)
+            action.triggered.connect(lambda checked=False, item=source: self._use_history_source(item))
+
+    def _use_history_source(self, source: FirmwareSource) -> None:
+        if source.kind == "build":
+            self.build_import_requested.emit(source.path)
+        else:
+            self.set_firmware_path(source.path, auto_address=True)
+            self.firmware_used.emit(source.path)
+
+    def set_firmware_path(self, path: str, auto_address: bool = False) -> None:
+        self._accepted_path = path
+        self.path_edit.setText(path)
+        if auto_address:
+            self._auto_set_addr(path)
+
+    def restore_path(self) -> None:
+        self.path_edit.setText(self._accepted_path)
+
+    def _browse_build(self) -> None:
+        directory = get_existing_directory(self, "导入 ESP-IDF build 目录（替换整个烧录清单）")
+        if directory:
+            self.build_import_requested.emit(directory)
+
+    def _finish_path_edit(self) -> None:
+        text = self.path_edit.text().strip()
+        try:
+            path = resolve_existing_path(text)
+            is_build = bool(text) and (path.is_dir() or (not path.is_file() and path.suffix.lower() != ".bin"))
+        except OSError:
+            is_build = bool(text)
+        if is_build:
+            self.build_import_requested.emit(text)
+        else:
+            self._accepted_path = self.path_edit.text()
+            if text and path.is_file():
+                self.firmware_used.emit(str(path))
 
     def _auto_set_addr(self, path: str) -> None:
         """从文件名中提取地址标记（如 _0x10000），无则置 0x0。"""
@@ -416,23 +503,44 @@ class FlashEntryRow(QWidget):
 class OtoolEsptoolUI(QMainWindow):
     _avatar_ready = pyqtSignal(bytes)
 
-    def __init__(self) -> None:
+    def __init__(self, policy_store: DevicePolicyStore | None = None) -> None:
         super().__init__()
         self.device_cards: dict[str, DeviceCard] = {}
         self.device_infos: dict[str, DeviceInfo] = {}
         self.new_device_ids: set[str] = set()
         self.acknowledged_device_ids: set[str] = set()
-        self._port_registry = PortOwnershipRegistry()
+        self._device_policy = policy_store if policy_store is not None else DevicePolicyStore.persistent()
+        self._firmware_history = FirmwareHistoryStore(
+            self._device_policy.path.with_name("firmware_history.json") if self._device_policy.path is not None else None
+        )
+        state_dir = self._device_policy.path.parent if self._device_policy.path is not None else None
+        self._flash_history = FlashHistoryStore(state_dir / "flash_history.json" if state_dir else None)
+        self._flash_history_save_error = ""
+        self._history_preferences = HistoryPreferences(state_dir / "ui_preferences.json" if state_dir else None)
+        self._active_flash_runs: dict[str, FlashRunTimer] = {}
+        self._history_timer = QTimer(self)
+        self._history_timer.setInterval(1000)
+        self._history_timer.timeout.connect(self._refresh_flash_history)
+        self._port_registry = PortOwnershipRegistry(self._device_policy)
+        self._port_auto_flash: set[str] = set()
+        self._port_auto_generations: dict[str, int] = {}
         self._device_port_leases: dict[str, PortLease] = {}
         self._pending_retries: dict[str, QTimer] = {}
+        self._pending_auto_flash: dict[str, QTimer] = {}
+        self._auto_flash_cycles: dict[str, AutoFlashCycle] = {}
+        self._auto_flash_removal_timers: dict[str, QTimer] = {}
+        self._chip_probes: dict[str, ChipInfoProbe] = {}
         self._auto_flash_generation = 0
+        self._build_flash_config: BuildFlashConfig | None = None
         self.refresh_timer = QTimer(self)
         self.refresh_timer.setInterval(2500)
         self.refresh_timer.timeout.connect(self.refresh_ports)
         self.setWindowTitle(f"{APP_TITLE} v{APP_VERSION}")
         self.resize(1320, 816)
         self._init_ui()
+        self._device_policy.changed.connect(self._on_device_policy_changed)
         self._apply_style()
+        self._refresh_flash_history()
         self._card_scale: float = 1.0
         QApplication.instance().installEventFilter(self)
         self.auto_pick_firmware()
@@ -493,6 +601,14 @@ class OtoolEsptoolUI(QMainWindow):
         self.flash_all_button.clicked.connect(self.flash_all_devices)
         self.erase_all_button = QPushButton("全部擦除")
         self.erase_all_button.clicked.connect(self.erase_all_devices)
+        self.show_history_button = QPushButton("显示历史")
+        self.show_history_button.setObjectName("historyToggle")
+        self.show_history_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.show_history_button.setStyleSheet("QPushButton:checked { background:#2560e0; color:#ffffff; border-color:#1a4db5; }")
+        self.show_history_button.setCheckable(True)
+        self.show_history_button.setChecked(self._history_preferences.show_history)
+        self.show_history_button.setToolTip("显示按 MAC 汇总的烧录历史与阶段耗时")
+        self.show_history_button.toggled.connect(self._toggle_flash_history)
         self.stop_all_button = QPushButton("全部停止")
         self.stop_all_button.setObjectName("dangerButton")
         self.stop_all_button.clicked.connect(self.stop_all_devices)
@@ -514,6 +630,7 @@ class OtoolEsptoolUI(QMainWindow):
         _fbg.addWidget(self.auto_flash_button)
         _fbg.addWidget(self.flash_all_button)
         _fbg.addWidget(self.erase_all_button)
+        _fbg.addWidget(self.show_history_button)
         # 熔丝台控件组（初始隐藏）
         self._efuse_btns_group = QWidget()
         _ebg = QHBoxLayout(self._efuse_btns_group)
@@ -593,12 +710,24 @@ class OtoolEsptoolUI(QMainWindow):
         entries_header.addStretch(1)
         entries_header.addWidget(self._add_entry_btn)
 
+        self._build_params_group = QWidget()
+        build_params_layout = QHBoxLayout(self._build_params_group)
+        build_params_layout.setContentsMargins(0, 0, 0, 0)
+        self._build_params_label = QLabel()
+        self._build_params_label.setWordWrap(True)
+        self._reset_build_params_btn = QPushButton("恢复默认参数")
+        self._reset_build_params_btn.clicked.connect(self._reset_build_params)
+        build_params_layout.addWidget(self._build_params_label, 1)
+        build_params_layout.addWidget(self._reset_build_params_btn)
+        self._build_params_group.setVisible(False)
+
         self._entries_inner = QWidget()
         self._entries_vbox = QVBoxLayout(self._entries_inner)
         self._entries_vbox.setContentsMargins(0, 0, 0, 0)
         self._entries_vbox.setSpacing(2)
 
         entries_layout.addLayout(entries_header)
+        entries_layout.addWidget(self._build_params_group)
         entries_layout.addWidget(self._entries_inner)
 
         self._flash_cfg_group = entries_outer
@@ -642,8 +771,24 @@ class OtoolEsptoolUI(QMainWindow):
         pg0_layout = QVBoxLayout(page_flash)
         pg0_layout.setContentsMargins(0, 0, 0, 0)
         pg0_layout.setSpacing(8)
-        pg0_layout.addLayout(device_header)
-        pg0_layout.addWidget(scroll, 1)
+        live_devices = QWidget()
+        live_layout = QVBoxLayout(live_devices)
+        live_layout.setContentsMargins(0, 0, 0, 0)
+        live_layout.setSpacing(8)
+        live_layout.addLayout(device_header)
+        live_layout.addWidget(scroll, 1)
+        self._history_panel = FlashHistoryPanel()
+        self._history_panel.close_requested.connect(lambda: self.show_history_button.setChecked(False))
+        self._history_panel.setVisible(self.show_history_button.isChecked())
+        self._flash_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._flash_splitter.setChildrenCollapsible(False)
+        self._flash_splitter.setHandleWidth(10)
+        self._flash_splitter.addWidget(live_devices)
+        self._flash_splitter.addWidget(self._history_panel)
+        self._flash_splitter.setStretchFactor(0, 1)
+        self._flash_splitter.setStretchFactor(1, 0)
+        self._flash_splitter.setSizes([900, 390])
+        pg0_layout.addWidget(self._flash_splitter, 1)
 
         # 页 1 — 熔丝台
         page_efuse = QWidget()
@@ -836,7 +981,7 @@ class OtoolEsptoolUI(QMainWindow):
             self.tab_switcher.set_current(0)
         if self._flash_rows:
             row = self._flash_rows[0]
-            row.path_edit.setText(output_path)
+            row.set_firmware_path(output_path)
             row.addr_edit.setText("0x0")
 
     def _apply_style(self) -> None:
@@ -877,6 +1022,27 @@ class OtoolEsptoolUI(QMainWindow):
             QFrame#deviceCard[cardState="disconnected"] {
                 background: #f7f8fa;
                 border: 1px solid #c5cad4;
+            }
+            QFrame#deviceCard[cardState="blocked"] {
+                border: 1px solid #9ca3af;
+                background: #f3f4f6;
+            }
+            QToolButton#deviceMenuButton {
+                background: transparent;
+                border: 1px solid transparent;
+                border-radius: 4px;
+                padding: 2px;
+            }
+            QToolButton#deviceMenuButton:hover, QToolButton#deviceMenuButton:focus {
+                background: #dbeafe;
+                border-color: #93b4f0;
+            }
+            QToolButton#deviceMenuButton:pressed {
+                background: #bfdbfe;
+            }
+            QLabel#stateBlocked {
+                color: #6b7280;
+                font-weight: 600;
             }
             QLabel#heroTitle {
                 font-size: 18px;
@@ -997,29 +1163,6 @@ class OtoolEsptoolUI(QMainWindow):
                 color: #9aa5bc;
                 font-weight: 600;
                 font-size: 12px;
-            }
-            QLabel#statusDot {
-                background: #14a05c;
-                border-radius: 5px;
-                min-width: 10px;
-                min-height: 10px;
-                max-width: 10px;
-                max-height: 10px;
-            }
-            QFrame#deviceCard[cardState="busy"] QLabel#statusDot {
-                background: #f59e0b;
-            }
-            QFrame#deviceCard[cardState="success"] QLabel#statusDot {
-                background: #14a05c;
-            }
-            QFrame#deviceCard[cardState="new"] QLabel#statusDot {
-                background: #2560e0;
-            }
-            QFrame#deviceCard[cardState="error"] QLabel#statusDot {
-                background: #e53935;
-            }
-            QFrame#deviceCard[cardState="disconnected"] QLabel#statusDot {
-                background: #9aa5bc;
             }
             QLabel#stateIdle {
                 color: #14a05c;
@@ -1343,8 +1486,7 @@ class OtoolEsptoolUI(QMainWindow):
         if candidates:
             chosen = str(candidates[0])
             first = self._flash_rows[0]
-            first.path_edit.setText(chosen)
-            first._auto_set_addr(chosen)
+            first.set_firmware_path(chosen, auto_address=True)
 
     def _sync_new_badge(self, device_id: str) -> None:
         card = self.device_cards.get(device_id)
@@ -1374,6 +1516,7 @@ class OtoolEsptoolUI(QMainWindow):
         default_hidden_count = 0
         show_all = self.show_all_devices_button.isChecked()
         for port_info in enumerated_ports:
+            self._port_registry.observe_device(port_info)
             device_id = self._make_device_id(port_info)
             all_active_ids.add(device_id)
             default_hidden = is_default_hidden_serial_port(port_info)
@@ -1399,6 +1542,9 @@ class OtoolEsptoolUI(QMainWindow):
                 connected=True,
                 serial_number=getattr(port_info, "serial_number", "") or "",
                 hwid=getattr(port_info, "hwid", "") or "",
+                vid=getattr(port_info, "vid", None),
+                pid=getattr(port_info, "pid", None),
+                location=getattr(port_info, "location", "") or "",
             )
             ports.append(device)
 
@@ -1424,69 +1570,89 @@ class OtoolEsptoolUI(QMainWindow):
                 card.update_device(disconnected)
                 card.set_result_state("设备已断开", "disconnected")
             else:
+                self._cancel_auto_flash(device_id)
                 self._cancel_retry(device_id)
+                if any(cycle.device_id == device_id for cycle in self._auto_flash_cycles.values()):
+                    # Keep the successful result and removal/ready messages visible.
+                    card.device.connected = False
+                    card.update_device(card.device)
+                    continue
                 self.device_cards.pop(device_id, None)
                 self.device_infos.pop(device_id, None)
                 card.setParent(None)
                 card.deleteLater()
 
         for device in ports:
+            pending_station = self._waiting_auto_flash_cycle(device)
+            if (pending_station is not None and pending_station.device_id != device.device_id
+                    and pending_station.device_id in self.device_cards):
+                # A USB adapter changing identity is not evidence of a new chip.
+                # Retain one station card until a MAC probe confirms the target.
+                continue
+            resumed_cycle = self._resume_auto_flash_cycle(device)
             self.device_infos[device.device_id] = device
             if device.device_id in self.device_cards:
-                self.device_cards[device.device_id].update_device(device)
+                existing_card = self.device_cards[device.device_id]
+                # Excluded cards remain visible for recovery, but polling does
+                # not refresh their chip metadata or enqueue any work.
+                if self._port_registry.is_blocked(device):
+                    existing_card.device.connected = True
+                else:
+                    existing_card.update_device(device)
+                self._sync_device_policy(device.device_id)
                 self._sync_new_badge(device.device_id)
+                if resumed_cycle and not existing_card.blocked:
+                    self._schedule_auto_flash(device.device_id, existing_card)
             else:
                 card = DeviceCard(device)
+                card.menu_requested.connect(
+                    lambda position, target=card: self._show_device_menu(target.device.device_id, position)
+                )
                 card.erase_button.clicked.connect(
                     lambda _checked=False,
-                    device_id=device.device_id: self._handle_device_action(
-                        device_id, "erase"
+                    target=card: self._handle_device_action(
+                        target.device.device_id, "erase"
                     )
                 )
                 card.flash_button.clicked.connect(
                     lambda _checked=False,
-                    device_id=device.device_id: self._handle_device_action(
-                        device_id, "flash"
+                    target=card: self._handle_device_action(
+                        target.device.device_id, "flash"
                     )
                 )
                 card.reset_button.clicked.connect(
                     lambda _checked=False,
-                    device_id=device.device_id: self._handle_device_action(
-                        device_id, "reset"
+                    target=card: self._handle_device_action(
+                        target.device.device_id, "reset"
                     )
                 )
                 card.export_button.clicked.connect(
                     lambda _checked=False,
-                    device_id=device.device_id: self._handle_device_action(
-                        device_id, "export"
+                    target=card: self._handle_device_action(
+                        target.device.device_id, "export"
                     )
                 )
                 card.efuse_button.clicked.connect(
                     lambda _checked=False,
-                    device_id=device.device_id: self._open_efuse_dialog(device_id)
+                    target=card: self._open_efuse_dialog(target.device.device_id)
                 )
                 card.efuse_button.setContextMenuPolicy(
                     Qt.ContextMenuPolicy.CustomContextMenu
                 )
                 card.efuse_button.customContextMenuRequested.connect(
-                    lambda pos, device_id=device.device_id: self._show_efuse_context_menu(
-                        device_id, pos
+                    lambda pos, target=card: self._show_efuse_context_menu(
+                        target.device.device_id, pos
                     )
                 )
                 self.device_cards[device.device_id] = card
+                self._sync_device_policy(device.device_id)
                 if device.device_id not in self.acknowledged_device_ids:
                     self.new_device_ids.add(device.device_id)
                 self._sync_new_badge(device.device_id)
                 if self._card_scale != 1.0:
                     card.apply_scale(self._card_scale)
-                if self.auto_flash_button.isChecked():
-                    QTimer.singleShot(
-                        100,
-                        lambda device_id=device.device_id, expected_card=card,
-                        generation=self._auto_flash_generation: self._auto_flash_new_device(
-                            device_id, expected_card, generation
-                        ),
-                    )
+                if self._auto_flash_enabled(device.port) and not card.blocked:
+                    self._schedule_auto_flash(device.device_id, card)
 
         self._rebuild_device_grid()
         self._update_stats()
@@ -1502,6 +1668,8 @@ class OtoolEsptoolUI(QMainWindow):
             else f"状态: 已识别 {len(self.device_cards)} 台设备，新增 {len(set(self.device_cards) - previous_ids)} 台"
         )
         self.status_label.setText(status + hidden_note)
+        if self._device_policy.load_error:
+            self.status_label.setText(f"状态: {self._device_policy.load_error}；设备操作已暂停")
         if show_all:
             self.show_all_devices_button.setToolTip(
                 f"正在显示全部串口，其中 {default_hidden_count} 个通常会被屏蔽"
@@ -1579,12 +1747,48 @@ class OtoolEsptoolUI(QMainWindow):
     # ── 多条目烧录管理 ──────────────────────────────────────────
 
     def _add_flash_entry(self, addr: str = "0x0", path: str = "") -> "FlashEntryRow":
-        row = FlashEntryRow(addr, path, parent=self._entries_inner)
+        row = FlashEntryRow(addr, path, parent=self._entries_inner, history=self._firmware_history)
         row.remove_requested.connect(lambda r=row: self._remove_flash_entry(r))
+        row.build_import_requested.connect(lambda directory, r=row: self._import_idf_build(directory, r))
+        row.firmware_used.connect(lambda filename: self._remember_firmware_source("bin", filename))
         self._flash_rows.append(row)
         self._entries_vbox.addWidget(row)
         self._update_remove_btns()
         return row
+
+    def _import_idf_build(self, directory: str, source_row: FlashEntryRow | None = None) -> bool:
+        try:
+            config = load_idf_build(Path(directory))
+        except ValueError as exc:
+            if source_row is not None:
+                source_row.restore_path()
+            QMessageBox.warning(self, "导入 build 失败", str(exc))
+            return False
+        old_rows = self._flash_rows
+        self._flash_rows = []
+        for row in old_rows:
+            self._entries_vbox.removeWidget(row)
+            row.hide()
+            row.deleteLater()
+        self._build_flash_config = config
+        for address, path in config.entries:
+            self._add_flash_entry(address, path)
+        self._build_params_label.setText(config.summary)
+        self._build_params_label.setToolTip(f"构建目录：{config.directory}\n清单或参数变化后，请重新导入。")
+        self._build_params_group.setVisible(True)
+        self._remember_firmware_source("build", config.directory)
+        return True
+
+    def _remember_firmware_source(self, kind: str, path: str | Path) -> None:
+        try:
+            self._firmware_history.remember(kind, path)
+        except OSError as exc:
+            self.status_label.setText(f"状态: 历史记录保存失败：{exc}；当前固件选择仍有效")
+
+    def _reset_build_params(self) -> None:
+        self._build_flash_config = None
+        self._build_params_group.setVisible(False)
+        self._build_params_label.clear()
 
     def _remove_flash_entry(self, row: "FlashEntryRow") -> None:
         if len(self._flash_rows) <= 1:
@@ -1643,6 +1847,8 @@ class OtoolEsptoolUI(QMainWindow):
 
     def _handle_device_action(self, device_id: str, action: str) -> None:
         card = self.device_cards.get(device_id)
+        if card is not None and self._port_registry.is_blocked(card.device):
+            return
         if card is not None and (card.process is not None or device_id in self._pending_retries):
             self.stop_process(device_id)
             return
@@ -1668,7 +1874,7 @@ class OtoolEsptoolUI(QMainWindow):
 
     def reset_device(self, device_id: str, acknowledge: bool = True) -> None:
         card = self.device_cards.get(device_id)
-        if card is None or not card.device.connected:
+        if card is None or not card.device.connected or self._port_registry.is_blocked(card.device):
             return
         if not self._validate_common_inputs(require_bin=False):
             return
@@ -1687,6 +1893,8 @@ class OtoolEsptoolUI(QMainWindow):
         )
 
     def export_firmware(self, device_id: str, acknowledge: bool = True) -> None:
+        if (info := self.device_infos.get(device_id)) is None or self._port_registry.is_blocked(info):
+            return
         if not self._validate_common_inputs(require_bin=False):
             return
         baud_text = self.baud_edit.currentText().strip()
@@ -1740,7 +1948,7 @@ class OtoolEsptoolUI(QMainWindow):
 
     def erase_flash(self, device_id: str, acknowledge: bool = True) -> None:
         card = self.device_cards.get(device_id)
-        if card is None or not card.device.connected:
+        if card is None or not card.device.connected or self._port_registry.is_blocked(card.device):
             return
         if not self._validate_common_inputs(require_bin=False):
             return
@@ -1760,21 +1968,40 @@ class OtoolEsptoolUI(QMainWindow):
             backend_text="内置 esptool API worker",
         )
 
-    def flash_firmware(self, device_id: str, acknowledge: bool = True) -> None:
+    def flash_firmware(self, device_id: str, acknowledge: bool = True, *, automatic_flash: bool = False) -> None:
         card = self.device_cards.get(device_id)
-        if card is None or not card.device.connected:
+        if card is None or not card.device.connected or self._port_registry.is_blocked(card.device):
             return
         if not self._validate_common_inputs(require_bin=False):
             return
         entries = self._get_valid_flash_entries()
         if entries is None:
             return
+        config = self._build_flash_config
+        if config is not None and config.chip:
+            info = self.device_infos.get(device_id)
+            detected_chip = resolve_chip_arg(info.chip_name if info else "")
+            if detected_chip != "auto" and detected_chip != config.chip:
+                QMessageBox.warning(
+                    self, "芯片不匹配",
+                    f"项目芯片 {config.chip} 与设备芯片 {detected_chip} 不一致，请选择匹配的设备或构建产物。",
+                )
+                return
         if acknowledge:
             self._acknowledge_device(device_id)
         flash_pairs: list[str] = []
         for addr, path in entries:
             flash_pairs += [addr, path]
-        esptool_args = self._build_esptool_base_args(device_id) + ["write-flash"] + flash_pairs
+        base_args = self._build_esptool_base_args(device_id)
+        write_args: list[str] = []
+        if config is not None:
+            global_args = config.global_args
+            if config.chip:
+                base_args[base_args.index("--chip") + 1] = config.chip
+                global_args = global_args[2:]
+            base_args.extend(global_args)
+            write_args = config.write_flash_args
+        esptool_args = base_args + ["write-flash"] + write_args + flash_pairs
         self._start_process(
             card,
             _build_tool_worker_command("esptool", *esptool_args),
@@ -1784,11 +2011,20 @@ class OtoolEsptoolUI(QMainWindow):
                 _build_tool_command("esptool", *esptool_args)
             ),
             backend_text="内置 esptool API worker",
+            expected_chip=config.chip if config is not None else None,
+            automatic_flash=automatic_flash,
         )
+        if card.process is not None:
+            if config is not None:
+                self._remember_firmware_source("build", config.directory)
+            else:
+                for _, filename in reversed(entries):
+                    self._remember_firmware_source("bin", filename)
 
     def _auto_flash_new_device(
         self, device_id: str, expected_card: DeviceCard | None = None,
         generation: int | None = None,
+        port_generation: int | None = None,
     ) -> None:
         card = self.device_cards.get(device_id)
         info = self.device_infos.get(device_id)
@@ -1798,23 +2034,404 @@ class OtoolEsptoolUI(QMainWindow):
             or not info.connected
             or card.process is not None
             or card._stop_requested
-            or device_id not in self.new_device_ids
+            or self._waiting_auto_flash_cycle(info) is not None
+            or self._port_registry.is_blocked(info)
+            or (device_id not in self.new_device_ids and canonical_port(info.port) not in self._port_auto_flash)
             or device_id in self._pending_retries
-            or not self.auto_flash_button.isChecked()
+            or not self._auto_flash_enabled(info.port)
             or (expected_card is not None and card is not expected_card)
-            or (generation is not None and generation != self._auto_flash_generation)
+            or (generation is not None and generation != self._auto_flash_generation
+                and canonical_port(info.port) not in self._port_auto_flash)
+            or (port_generation is not None and port_generation != self._port_auto_generations.get(canonical_port(info.port), 0))
         ):
             return
         if not self._validate_common_inputs(require_bin=True):
             return
-        self.flash_firmware(device_id, acknowledge=False)
+        self.flash_firmware(device_id, acknowledge=False, automatic_flash=True)
+
+    def _auto_flash_enabled(self, port: str) -> bool:
+        return self.auto_flash_button.isChecked() or canonical_port(port) in self._port_auto_flash
+
+    def _schedule_auto_flash(self, device_id: str, card: DeviceCard) -> None:
+        self._cancel_auto_flash(device_id)
+        if self._waiting_auto_flash_cycle(card.device) is not None:
+            return
+        generation = self._auto_flash_generation
+        port_generation = self._port_auto_generations.get(canonical_port(card.device.port), 0)
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        self._pending_auto_flash[device_id] = timer
+
+        def run() -> None:
+            if self._pending_auto_flash.get(device_id) is not timer:
+                return
+            self._cancel_auto_flash(device_id)
+            self._auto_flash_new_device(device_id, card, generation, port_generation)
+
+        timer.timeout.connect(run)
+        timer.start(100)
+
+    def _cancel_auto_flash(self, device_id: str) -> None:
+        timer = self._pending_auto_flash.pop(device_id, None)
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
+
+    def _waiting_auto_flash_cycle(self, device: DeviceInfo) -> AutoFlashCycle | None:
+        identity = DeviceIdentity.from_device(device)
+        return next((cycle for cycle in self._auto_flash_cycles.values()
+                     if (cycle.waiting_for_removal or not cycle.next_mac) and (
+                         canonical_port(cycle.port) == canonical_port(device.port)
+                         or cycle.identity_key == identity.key)), None)
+
+    def _removal_monitor_enabled(self, cycle: AutoFlashCycle) -> bool:
+        return bool(
+            not cycle.stopped
+            and self._auto_flash_enabled(cycle.port)
+            and not self._device_policy.load_error
+            and not self._device_policy.is_port_rule(cycle.port)
+            and cycle.identity_key not in self._device_policy.blocked_devices
+        )
+
+    def _cancel_removal_timer(self, key: str) -> None:
+        timer = self._auto_flash_removal_timers.pop(key, None)
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
+        probe = self._chip_probes.pop(key, None)
+        if probe is not None:
+            probe.cancel()
+
+    def _sync_removal_monitors(self) -> None:
+        for key in list(self._auto_flash_removal_timers):
+            cycle = self._auto_flash_cycles.get(key)
+            if cycle is None or not self._removal_monitor_enabled(cycle):
+                self._cancel_removal_timer(key)
+        for key, cycle in self._auto_flash_cycles.items():
+            if key in self._auto_flash_removal_timers or not self._removal_monitor_enabled(cycle):
+                continue
+            timer = QTimer(self)
+            timer.setTimerType(Qt.TimerType.PreciseTimer)
+            timer.setInterval(AUTO_REMOVAL_POLL_INTERVAL_MS)
+            timer.timeout.connect(lambda station=key, expected=cycle: self._poll_auto_flash_removal(station, expected))
+            self._auto_flash_removal_timers[key] = timer
+            timer.start()
+
+    def _begin_auto_flash_removal_wait(self, card: DeviceCard) -> None:
+        key = canonical_port(card.device.port)
+        self._cancel_auto_flash(card.device.device_id)
+        self._cancel_removal_timer(key)
+        cycle = AutoFlashCycle(card.device.device_id, card.device.port, DeviceIdentity.from_device(card.device).key)
+        cycle.mac = normalize_mac(card.device.mac)
+        self._auto_flash_cycles[key] = cycle
+        self.new_device_ids.discard(card.device.device_id)
+        card.set_newly_detected(False)
+        card.set_result_state("成功，待移除", "success")
+        card.set_stage_text("烧录完成，请拔出设备")
+        card.append_log("[自动烧录] 本次烧录已完成，请拔出当前设备。")
+        card.append_log("[芯片检测] 每 3 秒读取芯片信息与 MAC。")
+        card.append_log("[芯片检测] 连续两次无响应后确认离线。")
+        if not self._removal_monitor_enabled(cycle):
+            card.append_log("[自动烧录] 连接状态检测已暂停。")
+            card.append_log("[自动烧录] 重新启用后将先确认设备移除。")
+        self.status_label.setText(f"状态: {cycle.port} 烧录成功，等待设备移除")
+        self._sync_removal_monitors()
+
+    def _poll_auto_flash_removal(self, key: str, expected: AutoFlashCycle | None = None) -> None:
+        cycle = self._auto_flash_cycles.get(key)
+        if cycle is None or (expected is not None and cycle is not expected):
+            return
+        if not self._removal_monitor_enabled(cycle):
+            self._cancel_removal_timer(key)
+            return
+        card = self.device_cards.get(cycle.device_id)
+        if key in self._chip_probes or (card is not None and card.process is not None):
+            return
+        cycle.checks += 1
+        try:
+            ports = list(list_ports.comports())
+        except Exception as exc:
+            if card is not None:
+                card.append_log(f"[设备检测] 第 {cycle.checks} 次检测失败：{exc}")
+                card.append_log("[设备检测] 尚未确认设备移除，3 秒后重试。")
+            self.status_label.setText(f"状态: {cycle.port} 连接状态检测失败，等待重新检测")
+            return
+        candidates = [pi for pi in ports if DeviceIdentity.from_device(pi).key == cycle.identity_key]
+        candidates += [pi for pi in ports if canonical_port(pi.device) == key and pi not in candidates]
+        if not candidates:
+            if cycle.waiting_for_removal:
+                self._complete_auto_flash_removal(key, cycle)
+            elif card is not None:
+                card.append_log("[芯片检测] 端口未接入，继续等待设备。")
+            return
+        target = candidates[0]
+        if self._port_registry.is_blocked(target):
+            cycle.stopped = True
+            self._sync_removal_monitors()
+            return
+        probe = ChipInfoProbe(target.device, self._port_registry, self)
+        self._chip_probes[key] = probe
+        probe.finished.connect(lambda result, station=key, expected=cycle: self._chip_probe_finished(station, expected, result))
+        probe.start()
+
+    def _chip_probe_finished(self, key: str, cycle: AutoFlashCycle, result: dict) -> None:
+        if self._auto_flash_cycles.get(key) is not cycle:
+            return
+        self._chip_probes.pop(key, None)
+        if not self._removal_monitor_enabled(cycle) or result.get("status") == "canceled":
+            return
+        card = self.device_cards.get(cycle.device_id)
+        state = result.get("status")
+        mac = normalize_mac(result.get("mac", ""))
+        if state == "present" and mac:
+            cycle.absent_checks = 0
+            if cycle.waiting_for_removal and (not cycle.mac or mac == cycle.mac):
+                cycle.mac = mac
+                if card is not None:
+                    card.append_log(f"[芯片检测] 第 {cycle.checks} 次：芯片仍在线。")
+                    card.append_log(f"[芯片检测] MAC：{mac}")
+                    card.append_log(f"[芯片检测] 当前端口：{result.get('port', cycle.port)}")
+                return
+            cycle.next_mac = mac
+            if card is not None:
+                card.append_log(f"[芯片检测] 已识别接入芯片：{mac}")
+            if cycle.waiting_for_removal:
+                self._complete_auto_flash_removal(key, cycle)
+            else:
+                self.refresh_ports()
+            return
+        if state == "absent":
+            if not cycle.waiting_for_removal:
+                if card is not None:
+                    card.append_log("[芯片检测] 未读取到芯片，继续等待接入。")
+                return
+            cycle.absent_checks += 1
+            if card is not None:
+                card.append_log(f"[芯片检测] 未读取到芯片信息（{cycle.absent_checks}/2）。")
+            if cycle.absent_checks >= 2:
+                self._complete_auto_flash_removal(key, cycle)
+            return
+        cycle.absent_checks = 0
+        if card is not None:
+            card.append_log(f"[芯片检测] {result.get('message', '读取异常，稍后重检')}")
+
+    def _complete_auto_flash_removal(self, key: str, cycle: AutoFlashCycle) -> None:
+        card = self.device_cards.get(cycle.device_id)
+        cycle.waiting_for_removal = False
+        if card is not None:
+            card.append_log(f"[芯片检测] 第 {cycle.checks} 次：已确认设备移除。")
+            card.append_log("[自动烧录] 已就绪，等待下一台设备接入。")
+            card.device.connected = False
+            card.update_device(card.device)
+            card.set_result_state("就绪，待接入", "success")
+            card.set_stage_text("已就绪，等待下一台设备接入")
+        self.refresh_ports()
+        self.status_label.setText(f"状态: {cycle.port} 已就绪，等待下一台设备接入")
+
+    def _resume_auto_flash_cycle(self, device: DeviceInfo) -> bool:
+        if not self._auto_flash_enabled(device.port) or self._port_registry.is_blocked(device):
+            return False
+        identity = DeviceIdentity.from_device(device)
+        found = next(((key, cycle) for key, cycle in self._auto_flash_cycles.items()
+                      if not cycle.waiting_for_removal and cycle.next_mac and not cycle.stopped and (
+                          key == canonical_port(device.port) or cycle.identity_key == identity.key)), None)
+        if found is None:
+            return False
+        key, cycle = found
+        self._auto_flash_cycles.pop(key)
+        self._cancel_removal_timer(key)
+        previous_card = self.device_cards.get(cycle.device_id)
+        card = self.device_cards.get(device.device_id)
+        if previous_card is not None and previous_card is not card:
+            self.device_cards.pop(cycle.device_id, None)
+            self.device_infos.pop(cycle.device_id, None)
+            if card is None:
+                card = previous_card
+                self.device_cards[device.device_id] = card
+                card.update_device(device)
+            else:
+                card.append_log(previous_card.log_edit.toPlainText())
+                previous_card.setParent(None)
+                previous_card.deleteLater()
+        self.new_device_ids.discard(cycle.device_id)
+        self.acknowledged_device_ids.discard(cycle.device_id)
+        self.acknowledged_device_ids.discard(device.device_id)
+        self.new_device_ids.add(device.device_id)
+        if card is not None:
+            card._stop_requested = False
+            device.mac = cycle.next_mac
+            card.update_device(device)
+            card.append_log("[自动烧录] 检测到设备接入，开始下一轮烧录准备。")
+            card.set_result_state("准备下一轮烧录", "idle")
+            card.set_stage_text("准备下一轮烧录")
+        return True
+
+    def _toggle_flash_history(self, visible: bool) -> None:
+        try:
+            self._history_preferences.set_visible(visible)
+        except OSError as exc:
+            self.show_history_button.blockSignals(True)
+            self.show_history_button.setChecked(self._history_preferences.show_history)
+            self.show_history_button.blockSignals(False)
+            self.status_label.setText(f"状态: 历史面板设置保存失败：{exc}")
+            return
+        self._history_panel.setVisible(visible)
+        if visible:
+            self._flash_splitter.setSizes([max(420, self.width() - 420), 390])
+        self._refresh_flash_history()
+
+    def _refresh_flash_history(self) -> None:
+        records = {record["id"]: record for record in self._flash_history.records}
+        for timer in self._active_flash_runs.values():
+            records[timer.record["id"]] = timer.snapshot()
+        if self.show_history_button.isChecked():
+            data = list(records.values())
+            self._history_panel.set_records(data,
+                                            error=self._flash_history_save_error or (
+                                                f"历史文件读取失败：{self._flash_history.load_error}"
+                                                if self._flash_history.load_error else ""))
+        if self._active_flash_runs and self.show_history_button.isChecked():
+            if not self._history_timer.isActive():
+                self._history_timer.start()
+        else:
+            self._history_timer.stop()
+
+    def _save_flash_history(self, record: dict) -> None:
+        try:
+            self._flash_history.upsert(record)
+            self._flash_history_save_error = ""
+        except (OSError, ValueError) as exc:
+            self._flash_history_save_error = f"历史记录未保存：{exc}"
+            self.status_label.setText(f"状态: 烧录历史暂未保存：{exc}")
+
+    def _observe_flash_information(self, card: DeviceCard) -> None:
+        timer = self._active_flash_runs.get(card.device.device_id)
+        if timer is not None:
+            info = chip_information(card._operation_output)
+            if info["mac"]:
+                timer.record["mac"] = info["mac"]
+            if info["chip"]:
+                timer.record["chip"] = DeviceCard._short_chip_name(info["chip"])
+
+    def _finish_flash_history(self, card: DeviceCard, status: str) -> None:
+        self._observe_flash_information(card)
+        timer = self._active_flash_runs.pop(card.device.device_id, None)
+        if timer is not None:
+            self._save_flash_history(timer.finish(status))
+            self._refresh_flash_history()
+
+    def _sync_device_policy(self, device_id: str) -> None:
+        card = self.device_cards.get(device_id)
+        if card is not None:
+            card.set_policy_state(self._port_registry.is_blocked(card.device),
+                                  canonical_port(card.device.port) in self._port_auto_flash)
+
+    def _on_device_policy_changed(self) -> None:
+        for device_id, card in self.device_cards.items():
+            self._sync_device_policy(device_id)
+            if card.blocked:
+                key = canonical_port(card.device.port)
+                self._port_auto_generations[key] = self._port_auto_generations.get(key, 0) + 1
+                self._cancel_auto_flash(device_id)
+                self._cancel_retry(device_id)
+                card._stop_requested = True
+            self._sync_new_badge(device_id)
+        self._update_stats()
+        # The same exclusions apply to already queued batch work.
+        self._verify_widget._poll_ports()
+        self._efuse_batch_widget._poll_ports()
+        self._terminal_widget.refresh_ports()
+        self._sync_removal_monitors()
+
+    def _set_device_blocked(self, device_id: str, scope: str, enabled: bool) -> None:
+        card = self.device_cards.get(device_id)
+        if card is None:
+            return
+        if self._port_registry.device_is_busy(card.device):
+            self.status_label.setText("状态: 请先完成或停止设备任务，再修改屏蔽规则")
+            return
+        identity = self._port_registry.observe_device(card.device)
+        try:
+            self._device_policy.set_blocked(identity, scope, enabled)
+        except OSError as exc:
+            QMessageBox.warning(self, "屏蔽记录保存失败", f"{exc}\n规则未修改，请检查本地目录的写入权限。")
+            return
+        self.status_label.setText(f"状态: {card.device.port} {'已屏蔽' if card.blocked else '已解除屏蔽'}，已保存到本地")
+
+    def _set_port_auto_flash(self, device_id: str, enabled: bool) -> None:
+        card = self.device_cards.get(device_id)
+        if card is None or self._port_registry.is_blocked(card.device):
+            return
+        key = canonical_port(card.device.port)
+        self._port_auto_generations[key] = self._port_auto_generations.get(key, 0) + 1
+        if enabled:
+            self._port_auto_flash.add(key)
+        else:
+            self._port_auto_flash.discard(key)
+            for did, other in self.device_cards.items():
+                if canonical_port(other.device.port) == key:
+                    self._cancel_auto_flash(did)
+                    if other._last_command_meta.get("automatic_flash"):
+                        self._cancel_retry(did)
+        for did, other in self.device_cards.items():
+            if canonical_port(other.device.port) == key:
+                self._sync_device_policy(did)
+        if enabled:
+            self.auto_refresh_button.setChecked(True)
+            for cycle in self._auto_flash_cycles.values():
+                if canonical_port(cycle.port) == key:
+                    cycle.stopped = False
+            if card.process is None:
+                card._stop_requested = False
+                self._schedule_auto_flash(device_id, card)
+        self._sync_removal_monitors()
+
+    def _create_device_menu(self, device_id: str) -> QMenu | None:
+        card = self.device_cards.get(device_id)
+        if card is None:
+            return None
+        menu = QMenu(card.menu_button)
+        menu.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        menu.setToolTipsVisible(True)
+        identity = self._port_registry.observe_device(card.device)
+        block_menu = menu.addMenu("屏蔽")
+        busy = self._port_registry.device_is_busy(card.device)
+        block_menu.setEnabled(not busy and not self._device_policy.load_error)
+        if busy:
+            block_menu.menuAction().setToolTip("请先完成或停止设备任务，再修改屏蔽规则")
+        elif self._device_policy.load_error:
+            block_menu.menuAction().setToolTip(self._device_policy.load_error)
+        block_menu.setToolTipsVisible(True)
+        for scope, title, checked in (
+            ("port", "按端口屏蔽", self._device_policy.is_port_rule(identity.port)),
+            ("device", "按设备屏蔽", self._device_policy.is_device_rule(identity)),
+        ):
+            action = block_menu.addAction(title)
+            action.setCheckable(True)
+            action.setChecked(checked)
+            action.triggered.connect(lambda enabled, rule=scope: self._set_device_blocked(device_id, rule, enabled))
+            if scope == "device" and not identity.portable:
+                action.setToolTip("设备未提供唯一标识，此规则将绑定当前端口")
+        auto_action = menu.addAction("自动烧录")
+        auto_action.setCheckable(True)
+        auto_action.setChecked(canonical_port(card.device.port) in self._port_auto_flash)
+        auto_action.setEnabled(not card.blocked)
+        auto_action.setToolTip("对当前串口启用自动烧录（本次运行有效），并开启自动刷新")
+        auto_action.triggered.connect(lambda enabled: self._set_port_auto_flash(device_id, enabled))
+        return menu
+
+    def _show_device_menu(self, device_id: str, position: QPoint) -> None:
+        menu = self._create_device_menu(device_id)
+        if menu is not None:
+            menu.exec(position)
+            menu.deleteLater()
 
     def erase_all_devices(self) -> None:
         if not self._validate_common_inputs(require_bin=False):
             return
         for port, card in list(self.device_cards.items()):
             info = self.device_infos.get(port)
-            if card.process is None and port not in self._pending_retries and (info is None or info.connected):
+            if not self._port_registry.is_blocked(card.device) and card.process is None and port not in self._pending_retries and (info is None or info.connected):
                 self.erase_flash(port)
 
     def flash_all_devices(self) -> None:
@@ -1822,7 +2439,7 @@ class OtoolEsptoolUI(QMainWindow):
             return
         for port, card in list(self.device_cards.items()):
             info = self.device_infos.get(port)
-            if card.process is None and port not in self._pending_retries and (info is None or info.connected):
+            if not self._port_registry.is_blocked(card.device) and card.process is None and port not in self._pending_retries and (info is None or info.connected):
                 self.flash_firmware(port)
 
     def stop_all_devices(self) -> bool:
@@ -1830,13 +2447,21 @@ class OtoolEsptoolUI(QMainWindow):
         stopped = True
         for device_id in list(self.device_cards):
             stopped = self.stop_process(device_id) and stopped
+        for cycle in self._auto_flash_cycles.values():
+            cycle.stopped = True
+        self._sync_removal_monitors()
         return stopped
 
     def clear_devices(self) -> None:
         """移除所有设备卡片并重置 NEW 状态，下次刷新时所有设备重新判定为新设备。"""
         self._auto_flash_generation += 1
+        for key, cycle in list(self._auto_flash_cycles.items()):
+            if not cycle.waiting_for_removal and cycle.next_mac:
+                self._auto_flash_cycles.pop(key)
+                self._cancel_removal_timer(key)
         retained = 0
         for device_id, card in list(self.device_cards.items()):
+            self._cancel_auto_flash(device_id)
             self._cancel_retry(device_id)
             if card.process is not None:
                 card._stop_requested = True
@@ -1878,6 +2503,16 @@ class OtoolEsptoolUI(QMainWindow):
     def toggle_auto_flash(self, enabled: bool) -> None:
         self._auto_flash_generation += 1
         self.auto_flash_button.setText(f"自动烧录: {'开' if enabled else '关'}")
+        if not enabled:
+            for device_id, card in self.device_cards.items():
+                if canonical_port(card.device.port) not in self._port_auto_flash:
+                    self._cancel_auto_flash(device_id)
+                    if card._last_command_meta.get("automatic_flash"):
+                        self._cancel_retry(device_id)
+        else:
+            for cycle in self._auto_flash_cycles.values():
+                cycle.stopped = False
+        self._sync_removal_monitors()
 
     def _start_process(
         self,
@@ -1888,21 +2523,52 @@ class OtoolEsptoolUI(QMainWindow):
         display_command: str | None = None,
         backend_text: str | None = None,
         _is_retry: bool = False,
+        expected_chip: str | None = None,
+        automatic_flash: bool = False,
     ) -> None:
         if self.device_cards.get(card.device.device_id) is not card or not card.device.connected:
+            return
+        if self._port_registry.is_blocked(card.device):
+            self._sync_device_policy(card.device.device_id)
+            return
+        if automatic_flash and self._waiting_auto_flash_cycle(card.device) is not None:
             return
         if card.process is not None:
             QMessageBox.information(
                 self, "提示", f"{card.device.port} 当前已有任务在运行。"
             )
             return
+        if not automatic_flash:
+            for key, cycle in self._auto_flash_cycles.items():
+                if cycle.device_id == card.device.device_id or canonical_port(cycle.port) == canonical_port(card.device.port):
+                    probe = self._chip_probes.pop(key, None)
+                    if probe is not None:
+                        probe.cancel()
         self._cancel_retry(card.device.device_id)
+        if not _is_retry:
+            card._auto_retry_count = 0
+        card._stop_requested = False
+        card._last_command = list(command)
+        card._last_command_meta = {
+            "busy_text": busy_text,
+            "active_action": active_action,
+            "display_command": display_command,
+            "backend_text": backend_text,
+            "expected_chip": expected_chip,
+            "automatic_flash": automatic_flash,
+            "auto_generation": self._auto_flash_generation,
+            "port_generation": self._port_auto_generations.get(canonical_port(card.device.port), 0),
+        }
         lease = self._port_registry.acquire(
             card.device.port,
             owner=f"flash:{card.device.device_id}",
             purpose="烧录台任务",
         )
         if lease is None:
+            if automatic_flash and self._automatic_retry_allowed(card):
+                self._queue_retry(card, card.device.device_id, list(command), dict(card._last_command_meta),
+                                  "串口被占用", AUTO_RETRY_DELAY_MS)
+                return
             if _is_retry:
                 card.set_result_state("重试失败：串口被占用", "error")
                 self._update_stats()
@@ -1915,16 +2581,18 @@ class OtoolEsptoolUI(QMainWindow):
             )
             return
         self._device_port_leases[card.device.device_id] = lease
-        if not _is_retry:
-            card._auto_retry_count = 0
-        card._stop_requested = False
-        card._last_command = list(command)
-        card._last_command_meta = {
-            "busy_text": busy_text,
-            "active_action": active_action,
-            "display_command": display_command,
-            "backend_text": backend_text,
-        }
+        if active_action == "flash":
+            firmware = []
+            try:
+                offset = command.index("write-flash") + 1
+                firmware = [command[i + 1] for i in range(offset, len(command) - 1)
+                            if re.fullmatch(r"0[xX][0-9a-fA-F]+", command[i])]
+            except ValueError:
+                pass
+            timer = FlashRunTimer(card.device.port, firmware)
+            self._active_flash_runs[card.device.device_id] = timer
+            self._save_flash_history(timer.snapshot())
+            self._refresh_flash_history()
         card.append_log("=" * 72)
         card.append_log("命令: " + (display_command or subprocess.list2cmdline(command)))
         card.append_log(f"工作目录: {TOOL_DIR}")
@@ -1945,6 +2613,10 @@ class OtoolEsptoolUI(QMainWindow):
         env = QProcessEnvironment.systemEnvironment()
         _inject_local_esptool_pythonpath(env)
         env.insert("PYTHONUTF8", "1")
+        # Do not inherit an automatic deadline into manual/eFuse workers.
+        env.remove(AUTO_DETECT_TIMEOUT_ENV)
+        if automatic_flash:
+            env.insert(AUTO_DETECT_TIMEOUT_ENV, str(AUTO_DETECT_TIMEOUT_SECONDS))
         process.setProcessEnvironment(env)
         process.readyRead.connect(
             lambda did=card.device.device_id, p=process: self._read_process_output(did, p)
@@ -2031,6 +2703,14 @@ class OtoolEsptoolUI(QMainWindow):
 
     def _handle_worker_event(self, card: DeviceCard, event: dict[str, object]) -> None:
         event_type = str(event.get("type", ""))
+        if event_type == "phase":
+            timer = self._active_flash_runs.get(card.device.device_id)
+            if timer is not None:
+                self._observe_flash_information(card)
+                timer.switch(str(event.get("phase", "")), event.get("elapsed_ms"))
+                self._save_flash_history(timer.snapshot())
+                self._refresh_flash_history()
+            return
         if event_type == "log":
             text = str(event.get("text", ""))
             card._operation_output = (card._operation_output + text + "\n")[-262144:]
@@ -2127,6 +2807,8 @@ class OtoolEsptoolUI(QMainWindow):
         self._read_process_output(device_id)
         self._flush_process_output_buffer(card)
         card.append_log(f"[状态] 进程已结束，退出码: {exit_code}")
+        result = "stopped" if card._stop_requested else "success" if exit_code == 0 and _exit_status == QProcess.ExitStatus.NormalExit else "failed"
+        self._finish_flash_history(card, result)
         if card._stop_requested:
             card.set_result_state("已停止", "error")
         elif exit_code == 0 and _exit_status == QProcess.ExitStatus.NormalExit:
@@ -2146,6 +2828,11 @@ class OtoolEsptoolUI(QMainWindow):
         self._update_stats()
         self.status_label.setText(f"状态: {card.device.port} 任务结束")
         self._cleanup_process(device_id)
+        if (not card._stop_requested and exit_code == 0
+                and _exit_status == QProcess.ExitStatus.NormalExit
+                and card._last_command_meta.get("automatic_flash")
+                and card._last_command_meta.get("active_action") == "flash"):
+            self._begin_auto_flash_removal_wait(card)
 
     def _process_error(
         self, device_id: str, error: QProcess.ProcessError,
@@ -2162,10 +2849,18 @@ class OtoolEsptoolUI(QMainWindow):
         # Crashed emits finished next; I/O errors may leave the process alive.
         # Keep its lease and stop button until its actual terminal event.
         if error == QProcess.ProcessError.FailedToStart:
+            self._finish_flash_history(card, "failed")
+            if card._last_command_meta.get("automatic_flash") and self._try_auto_retry(card, device_id):
+                return
             card.set_result_state("启动失败", "error")
             self._cleanup_process(device_id)
 
     def stop_process(self, device_id: str) -> bool:
+        self._cancel_auto_flash(device_id)
+        for cycle in self._auto_flash_cycles.values():
+            if cycle.device_id == device_id:
+                cycle.stopped = True
+        self._sync_removal_monitors()
         card = self.device_cards.get(device_id)
         if card is not None:
             card._stop_requested = True
@@ -2192,6 +2887,9 @@ class OtoolEsptoolUI(QMainWindow):
         return True
 
     def _open_efuse_dialog(self, device_id: str, preset: tuple[str, str] | None = None) -> None:
+        info = self.device_infos.get(device_id)
+        if info is not None and self._port_registry.is_blocked(info):
+            return
         info = self.device_infos.get(device_id)
         if info is None or not info.connected:
             return
@@ -2256,67 +2954,101 @@ class OtoolEsptoolUI(QMainWindow):
             return False
         timer.stop()
         timer.deleteLater()
+        card = self.device_cards.get(device_id)
+        if card is not None and card.process is None:
+            card.set_result_state("已取消重试", "error")
+        self._update_stats()
         return True
 
+    def _automatic_retry_allowed(self, card: DeviceCard) -> bool:
+        meta = card._last_command_meta
+        key = canonical_port(card.device.port)
+        return bool(
+            meta.get("automatic_flash") and meta.get("active_action") == "flash"
+            and not card._stop_requested and card.device.connected
+            and not self._port_registry.is_blocked(card.device)
+            and self._waiting_auto_flash_cycle(card.device) is None
+            and self._auto_flash_enabled(card.device.port)
+            and (meta.get("auto_generation") == self._auto_flash_generation
+                 or key in self._port_auto_flash)
+            and meta.get("port_generation") == self._port_auto_generations.get(key, 0)
+        )
+
     def _try_auto_retry(self, card: DeviceCard, device_id: str) -> bool:
-        """检测芯片类型不匹配错误并自动重试，返回 True 表示已触发重试。"""
-        if card._auto_retry_count >= 1 or card._stop_requested or not card.device.connected:
+        """Retry automatic flash failures; retain the manual chip correction rule."""
+        if card._stop_requested or not card.device.connected or self._port_registry.is_blocked(card.device):
             return False
-        log_text = card._operation_output
-        chip_match = re.search(r"This chip is ([\w\-]+), not", log_text)
-        if not chip_match:
+        automatic = bool(card._last_command_meta.get("automatic_flash"))
+        if automatic and not self._automatic_retry_allowed(card):
             return False
-        try:
-            chip_idx = card._last_command.index("--chip")
-        except ValueError:
+        if not automatic and card._auto_retry_count >= 1:
             return False
-        actual_chip = chip_match.group(1).lower().replace("-", "")
-        if chip_idx + 1 >= len(card._last_command) or actual_chip == card._last_command[chip_idx + 1]:
+        chip_match = re.search(r"This chip is ([\w\-]+), not", card._operation_output)
+        if chip_match and card._last_command_meta.get("expected_chip"):
+            # An imported build's target is immutable, even in automatic mode.
+            return False
+        if not automatic and not chip_match:
             return False
         new_cmd = list(card._last_command)
-        new_cmd[chip_idx + 1] = actual_chip
         meta = dict(card._last_command_meta)
-        new_display = meta.get("display_command") or ""
-        if new_display:
-            new_display = re.sub(r"--chip\s+\S+", f"--chip {actual_chip}", new_display)
+        reason = "本次自动烧录失败"
+        if chip_match:
+            try:
+                chip_idx = new_cmd.index("--chip")
+            except ValueError:
+                return False
+            actual_chip = chip_match.group(1).lower().replace("-", "")
+            if chip_idx + 1 >= len(new_cmd) or actual_chip == new_cmd[chip_idx + 1]:
+                return False
+            new_cmd[chip_idx + 1] = actual_chip
+            if meta.get("display_command"):
+                meta["display_command"] = re.sub(r"--chip\s+\S+", f"--chip {actual_chip}", meta["display_command"])
+            card.device.chip_name = chip_match.group(1)
+            info = self.device_infos.get(device_id)
+            if info is not None:
+                info.chip_name = chip_match.group(1)
+            card.update_device(card.device)
+            reason = f"检测到实际芯片 {chip_match.group(1)}，切换 --chip {actual_chip}"
         card._auto_retry_count += 1
-        # 立即更新卡片显示的芯片名（使用原始大小写，如 "ESP32-C6")
-        detected_chip_display = chip_match.group(1)  # e.g. "ESP32-C6"
-        card.device.chip_name = detected_chip_display
-        info = self.device_infos.get(device_id)
-        if info is not None:
-            info.chip_name = detected_chip_display
-        card.update_device(card.device)
-        card.append_log(
-            f"[自动重试] 检测到实际芯片: {chip_match.group(1)} "
-            f"→ 切换 --chip {actual_chip} 后重新执行..."
-        )
+        self._queue_retry(card, device_id, new_cmd, meta, reason,
+                          AUTO_RETRY_DELAY_MS if automatic else 300)
+        return True
+
+    def _queue_retry(self, card: DeviceCard, device_id: str, command: list[str],
+                     meta: dict, reason: str, delay_ms: int) -> None:
+        self._cancel_retry(device_id)
         self._cleanup_process(device_id)
+        wait_text = f"失败，{delay_ms / 1000:g} 秒后重试"
+        card.append_log(f"[自动重试] {reason}；{delay_ms / 1000:g} 秒后重试，可点击停止取消。")
+        card.set_running_state(wait_text, True, active_action=meta.get("active_action"))
+        card.set_stage_text(wait_text)
+        self.status_label.setText(f"状态: {card.device.port} {wait_text}")
         timer = QTimer(self)
         timer.setSingleShot(True)
+        timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._pending_retries[device_id] = timer
 
         def retry() -> None:
             if self._pending_retries.get(device_id) is not timer:
                 return
             self._cancel_retry(device_id)
-            if self.device_cards.get(device_id) is not card or not card.device.connected:
-                self._update_stats()
+            if (self.device_cards.get(device_id) is not card or not card.device.connected
+                    or card._stop_requested or self._port_registry.is_blocked(card.device)
+                    or (meta.get("automatic_flash") and not self._automatic_retry_allowed(card))):
                 return
             self._start_process(
-                card,
-                new_cmd,
-                meta.get("busy_text", "重试中"),
+                card, command, meta.get("busy_text", "重试中"),
                 active_action=meta.get("active_action"),
-                display_command=new_display or None,
+                display_command=meta.get("display_command"),
                 backend_text=meta.get("backend_text"),
+                expected_chip=meta.get("expected_chip"),
+                automatic_flash=bool(meta.get("automatic_flash")),
                 _is_retry=True,
             )
 
         timer.timeout.connect(retry)
-        timer.start(300)
+        timer.start(delay_ms)
         self._update_stats()
-        return True
 
     def _update_device_info_from_log(self, card: DeviceCard, device_id: str) -> None:
         """重试成功后从日志文本中解析完整芯片信息并刷新卡片。"""
@@ -2359,6 +3091,8 @@ class OtoolEsptoolUI(QMainWindow):
 
     def _cleanup_process(self, device_id: str) -> None:
         card = self.device_cards.get(device_id)
+        if card is not None:
+            self._finish_flash_history(card, "stopped" if card._stop_requested else "failed")
         if card is not None and card.process is not None:
             card.process.deleteLater()
             card.process = None

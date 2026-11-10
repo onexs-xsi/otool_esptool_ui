@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from threading import RLock
 from uuid import uuid4
 
+from .device_policy import DeviceIdentity, DevicePolicyStore
+
 
 def _canonical_port(port: str) -> str:
     return str(port or "").strip().casefold()
@@ -54,13 +56,38 @@ class PortLease:
 class PortOwnershipRegistry:
     """Thread-safe, non-blocking exclusive leases keyed by serial-port name."""
 
-    def __init__(self) -> None:
+    def __init__(self, policy: DevicePolicyStore | None = None) -> None:
         self._lock = RLock()
         self._claims: dict[str, PortClaim] = {}
+        self.policy = policy if policy is not None else DevicePolicyStore()
+        self._identities: dict[str, DeviceIdentity] = {}
+
+    def observe_device(self, device: object) -> DeviceIdentity:
+        identity = DeviceIdentity.from_device(device)
+        self._identities[_canonical_port(identity.port)] = identity
+        return identity
+
+    def is_blocked(self, device: object) -> bool:
+        if isinstance(device, str):
+            identity = self._identities.get(_canonical_port(device))
+            if identity is None:
+                return bool(self.policy.load_error) or self.policy.is_port_rule(device)
+        else:
+            identity = self.observe_device(device)
+        return self.policy.is_blocked(identity)
+
+    def device_is_busy(self, device: object) -> bool:
+        identity = self.observe_device(device)
+        with self._lock:
+            return any(
+                port == _canonical_port(identity.port)
+                or (port in self._identities and self._identities[port].key == identity.key)
+                for port in self._claims
+            )
 
     def acquire(self, port: str, owner: str, purpose: str) -> PortLease | None:
         key = _canonical_port(port)
-        if not key:
+        if not key or self.is_blocked(port):
             return None
         with self._lock:
             if key in self._claims:
@@ -79,7 +106,7 @@ class PortOwnershipRegistry:
             return self._claims.get(_canonical_port(port))
 
     def is_available(self, port: str) -> bool:
-        return self.claim_for(port) is None
+        return not self.is_blocked(port) and self.claim_for(port) is None
 
     def _release(self, claim: PortClaim) -> None:
         key = _canonical_port(claim.port)

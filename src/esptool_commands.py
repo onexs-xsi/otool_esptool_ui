@@ -5,6 +5,23 @@ from pathlib import Path
 import re
 
 
+def resolve_existing_path(filename: str | Path) -> Path:
+    """Prefer a literal Windows path, repairing Markdown escapes only if missing."""
+    path = Path(filename)
+    if path.exists():
+        return path
+    if "\\_" in str(filename):
+        candidate = Path(str(filename).replace("\\_", "_"))
+        if candidate.exists():
+            return candidate
+    text = str(filename)
+    if len(text) > 2 and text[0] == text[-1] == '"':
+        candidate = resolve_existing_path(text[1:-1])
+        if candidate.exists():
+            return candidate
+    return path
+
+
 def validate_flash_entries(entries: Sequence[tuple[str, str]]) -> list[tuple[str, str]]:
     """Validate files and erase-sector ranges before any device is opened."""
     validated: list[tuple[str, str]] = []
@@ -15,12 +32,8 @@ def validate_flash_entries(entries: Sequence[tuple[str, str]]) -> list[tuple[str
             continue
         if not re.fullmatch(r"0[xX][0-9a-fA-F]+", address):
             raise ValueError(f"第 {row} 行烧录地址无效，请使用十六进制，如 0x0、0x10000。")
-        path = Path(filename)
         try:
-            if not path.exists() and "\\_" in filename:
-                candidate = Path(filename.replace("\\_", "_"))
-                if candidate.exists():
-                    path = candidate
+            path = resolve_existing_path(filename)
             if not filename or not path.is_file():
                 raise ValueError(f"第 {row} 行请选择有效的固件文件：{filename!r}。")
             size = path.stat().st_size

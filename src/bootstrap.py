@@ -5,6 +5,7 @@ import importlib
 import importlib.util
 import site
 import traceback
+from contextlib import nullcontext
 from pathlib import Path
 
 from .constants import (
@@ -161,15 +162,25 @@ def dispatch_internal_worker() -> None:
     exit_code = 0
     try:
         module = importlib.import_module(tool_name)
-        if hasattr(module, "main"):
-            module.main(tool_args)
-        else:
-            saved_argv = sys.argv[:]
-            try:
-                sys.argv = [tool_name] + tool_args
-                module._main()
-            finally:
-                sys.argv = saved_argv
+        from .auto_flash import AUTO_DETECT_TIMEOUT_ENV, detection_deadline
+        timeout = os.environ.get(AUTO_DETECT_TIMEOUT_ENV)
+        guard = (
+            detection_deadline(module, float(timeout), emit_worker_event)
+            if tool_name == "esptool" and any(command in tool_args for command in ("write-flash", "read-mac")) and timeout
+            else nullcontext()
+        )
+        from .flash_timing import instrument_esptool_phases
+        phases = instrument_esptool_phases(module, emit_worker_event) if tool_name == "esptool" and "write-flash" in tool_args else nullcontext()
+        with guard, phases:
+            if hasattr(module, "main"):
+                module.main(tool_args)
+            else:
+                saved_argv = sys.argv[:]
+                try:
+                    sys.argv = [tool_name] + tool_args
+                    module._main()
+                finally:
+                    sys.argv = saved_argv
     except SystemExit as exc:
         if isinstance(exc.code, int):
             exit_code = exc.code

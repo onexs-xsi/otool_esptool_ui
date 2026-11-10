@@ -1403,6 +1403,8 @@ class VerifyWidget(QWidget):
     def _poll_ports(self) -> None:
         current_ports: dict[str, str] = {}
         for port_info in list_ports.comports():
+            if self._port_registry.is_blocked(port_info):
+                continue
             if port_info.description and re.search(
                 r"通信端口|Communications Port", port_info.description
             ):
@@ -1566,6 +1568,8 @@ class VerifyWidget(QWidget):
         return " / ".join(parts)
 
     def _start_task(self, task: VerifyTaskItem, profile: VerifyProfile | None = None) -> None:
+        if self._port_registry.is_blocked(task.port):
+            return
         if task.worker is not None or task.thread is not None:
             return
         if self.active_task_count() >= self.MAX_CONCURRENT:
@@ -1621,12 +1625,12 @@ class VerifyWidget(QWidget):
         if not self._tasks:
             QMessageBox.information(self, "提示", "设备队列为空，请先扫描或接入设备。")
             return
-        selected_ports = {task.port for task in self._tasks if task.selected}
+        selected_ports = {task.port for task in self._tasks if task.selected and not self._port_registry.is_blocked(task.port)}
         if not selected_ports:
             QMessageBox.information(self, "提示", "请先勾选至少一台设备。")
             return
         for task in self._tasks:
-            if task.selected and task.worker is None and task.thread is None and task.state != VerifyTaskState.RUNNING:
+            if task.port in selected_ports and task.worker is None and task.thread is None and task.state != VerifyTaskState.RUNNING:
                 task.state = VerifyTaskState.WAITING
                 task.current_step = "-"
         self._run_all_requested = True
@@ -1664,6 +1668,7 @@ class VerifyWidget(QWidget):
                     break
                 if (
                     task.port in self._batch_ports
+                    and not self._port_registry.is_blocked(task.port)
                     and task.state == VerifyTaskState.WAITING
                     and task.worker is None
                     and task.thread is None
@@ -1671,7 +1676,7 @@ class VerifyWidget(QWidget):
                     self._start_task(task, profile=profile)
                     running = self.active_task_count()
             if not any(
-                task.port in self._batch_ports and task.state == VerifyTaskState.WAITING
+                task.port in self._batch_ports and not self._port_registry.is_blocked(task.port) and task.state == VerifyTaskState.WAITING
                 for task in self._tasks
             ):
                 self._run_all_requested = False
@@ -1682,6 +1687,7 @@ class VerifyWidget(QWidget):
         if self._auto_mode:
             if not any(
                 task.selected and task.state == VerifyTaskState.WAITING
+                and not self._port_registry.is_blocked(task.port)
                 and task.worker is None and task.thread is None
                 for task in self._tasks
             ):
@@ -1692,7 +1698,7 @@ class VerifyWidget(QWidget):
             for task in self._tasks:
                 if running >= self.MAX_CONCURRENT:
                     break
-                if task.selected and task.state == VerifyTaskState.WAITING and task.worker is None and task.thread is None:
+                if task.selected and not self._port_registry.is_blocked(task.port) and task.state == VerifyTaskState.WAITING and task.worker is None and task.thread is None:
                     self._start_task(task, profile=profile)
                     running = self.active_task_count()
 

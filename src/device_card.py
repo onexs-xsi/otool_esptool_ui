@@ -1,8 +1,9 @@
 import codecs
 import re
+from pathlib import Path
 
-from PyQt6.QtCore import QProcess, QRectF, QSize, Qt
-from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QTextCursor
+from PyQt6.QtCore import QPoint, QPointF, QProcess, QRectF, QSize, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPolygonF, QTextCursor
 from PyQt6.QtWidgets import (
     QFrame,
     QGridLayout,
@@ -11,6 +12,7 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QToolButton,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -140,6 +142,84 @@ class ElidedLabel(QLabel):
         )
 
 
+def device_display_name(label: str, port: str) -> str:
+    """Leave the COM number in its dedicated badge, not in the device name."""
+    if not port:
+        return label.strip()
+    escaped = re.escape(port)
+    return re.sub(rf"\s*(?:\(\s*{escaped}\s*\)|\[\s*{escaped}\s*\]|\s+{escaped})\s*$", "", label,
+                  flags=re.IGNORECASE).strip() or label.strip()
+
+
+class DeviceTitleLabel(ElidedLabel):
+    """Width-aware middle omission, preserving the last word and six stars."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+
+    def _refresh_elided(self) -> None:
+        text, width, metrics = self._full_text, max(0, self.contentsRect().width()), self.fontMetrics()
+        display = text
+        if text and metrics.horizontalAdvance(text) > width:
+            # Keep a complete final model such as ESP32-S3. For a single
+            # compound descriptor, a hyphen/underscore can separate its tail.
+            words = list(re.finditer(r"\S+", text))
+            if len(words) == 1:
+                words = list(re.finditer(r"[^\s_-]+", text))
+            suffix_start = words[-1].start() if len(words) > 1 else max(1, len(text) // 2)
+            suffix = text[suffix_start:]
+            marker = "******"
+            while suffix and metrics.horizontalAdvance(marker + suffix) > width:
+                suffix = suffix[1:]
+            prefix = text[:suffix_start].rstrip()
+            while prefix and metrics.horizontalAdvance(prefix + marker + suffix) > width:
+                prefix = prefix[:-1]
+            display = prefix + marker + suffix
+        QLabel.setText(self, display)
+        self.setToolTip(text)
+        self.setAccessibleName(text)
+
+
+class CornerRibbon(QWidget):
+    AUTO_COLOR = QColor("#7c3aed")
+    BLOCK_COLOR = QColor("#6b7280")
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setFixedSize(76, 76)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.text = ""
+        self.hide()
+
+    def set_mode(self, blocked: bool, auto: bool) -> None:
+        self.text = "BLOCK" if blocked else "AUTO" if auto else ""
+        self.setVisible(bool(self.text))
+        self.setAccessibleName("已屏蔽" if blocked else "单串口自动烧录" if auto else "")
+        self.raise_()
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        band = QPolygonF([QPointF(0, 8), QPointF(0, 36), QPointF(40, 76), QPointF(68, 76)])
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(self.BLOCK_COLOR if self.text == "BLOCK" else self.AUTO_COLOR)
+        painter.drawPolygon(band)
+        painter.translate(28, 48)
+        painter.rotate(45)
+        painter.setPen(QColor("#ffffff"))
+        font = QFont(self.font())
+        font.setPixelSize(11)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(QRectF(-34, -13, 68, 26), Qt.AlignmentFlag.AlignCenter, self.text)
+        painter.end()
+
+
 class SplitTextProgressBar(QProgressBar):
     """进度文字按填充边界自动分色，避免蓝色进度块盖住深色文字。"""
 
@@ -206,6 +286,7 @@ class SplitTextProgressBar(QProgressBar):
 
 
 class DeviceCard(QFrame):
+    menu_requested = pyqtSignal(QPoint)
     _BASE_WIDTH = 380
     _BASE_LOG_HEIGHT = 200
 
@@ -221,12 +302,19 @@ class DeviceCard(QFrame):
         self._stop_requested = False
         self._output_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self._operation_output = ""
+        self.blocked = False
+        self.auto_flash_enabled = False
+        self._running = False
+        self._active_action: str | None = None
+        self._result_text = "空闲"
+        self._result_state = "idle"
         self.setObjectName("deviceCard")
         self.setProperty("cardState", "idle")
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Minimum)
         self.setFixedWidth(380)
         self._init_ui()
+        self.ribbon = CornerRibbon(self)
         self.update_device(device)
 
     def _init_ui(self) -> None:
@@ -237,21 +325,34 @@ class DeviceCard(QFrame):
         title_layout = QHBoxLayout()
         title_layout.setSpacing(6)
 
-        self.status_dot = QLabel()
-        self.status_dot.setObjectName("statusDot")
-        self.status_dot.setFixedSize(10, 10)
+        self.menu_button = QToolButton()
+        self.menu_button.setObjectName("deviceMenuButton")
+        self.menu_button.setIcon(QIcon(str(Path(__file__).parent / "assets" / "menu.svg")))
+        self.menu_button.setIconSize(QSize(15, 15))
+        self.menu_button.setFixedSize(22, 24)
+        self.menu_button.setAccessibleName("设备菜单")
+        self.menu_button.setToolTip("设备菜单：屏蔽 / 自动烧录")
+        self.menu_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.menu_button.clicked.connect(
+            lambda: self.menu_requested.emit(self.menu_button.mapToGlobal(QPoint(0, self.menu_button.height())))
+        )
         self.new_badge = QLabel("NEW")
         self.new_badge.setObjectName("newBadge")
         self.new_badge.hide()
         self.port_badge = QLabel()
         self.port_badge.setObjectName("portBadge")
-        self.title_label = ElidedLabel()
+        self.title_label = DeviceTitleLabel()
         self.title_label.setObjectName("deviceTitle")
+        for target in (self.menu_button, self.title_label):
+            target.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            target.customContextMenuRequested.connect(
+                lambda pos, widget=target: self.menu_requested.emit(widget.mapToGlobal(pos))
+            )
         self.summary_label = QLabel()
         self.summary_label.setObjectName("deviceSummary")
         self.summary_label.setWordWrap(False)
 
-        title_layout.addWidget(self.status_dot, 0, Qt.AlignmentFlag.AlignVCenter)
+        title_layout.addWidget(self.menu_button, 0, Qt.AlignmentFlag.AlignVCenter)
         title_layout.addWidget(self.title_label, 1, Qt.AlignmentFlag.AlignVCenter)
         title_layout.addWidget(self.new_badge, 0, Qt.AlignmentFlag.AlignVCenter)
         title_layout.addWidget(self.port_badge, 0, Qt.AlignmentFlag.AlignVCenter)
@@ -377,7 +478,7 @@ class DeviceCard(QFrame):
     def update_device(self, device: DeviceInfo) -> None:
         self.device = device
         self.port_badge.setText(device.port)
-        self.title_label.setText(device.label)
+        self.title_label.setText(device_display_name(device.label, device.port))
         summary_parts = []
         if device.chip_name and device.chip_name != "未识别":
             summary_parts.append(device.chip_name)
@@ -395,6 +496,46 @@ class DeviceCard(QFrame):
         self.flash_value.setText(device.flash_size or "-")
         self.crystal_value.setText(device.crystal or "-")
         self._update_cap_badges(device.features or "")
+        self._sync_action_buttons()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        if hasattr(self, "ribbon"):
+            self.ribbon.move(0, self.height() - self.ribbon.height())
+            self.ribbon.raise_()
+
+    def set_policy_state(self, blocked: bool, auto: bool) -> None:
+        changed = self.blocked != blocked
+        self.blocked, self.auto_flash_enabled = blocked, auto
+        self.ribbon.set_mode(blocked, auto)
+        self.ribbon.move(0, self.height() - self.ribbon.height())
+        self._sync_action_buttons()
+        if changed:
+            self._render_result_state()
+        self.menu_button.setAccessibleDescription(
+            "已屏蔽，可从菜单解除屏蔽" if blocked else "已启用单串口自动烧录" if auto else ""
+        )
+
+    def _sync_action_buttons(self) -> None:
+        allowed = not self.blocked and self.device.connected
+        self._set_action_button_mode(self._running, allowed, self._active_action)
+        self.efuse_button.setEnabled(allowed and not self._running)
+        reason = "设备已屏蔽，请从设备菜单解除屏蔽" if self.blocked else ""
+        for _, button, _ in self._action_buttons:
+            button.setToolTip(reason)
+        self.efuse_button.setToolTip(reason)
+
+    def _render_result_state(self) -> None:
+        state = "blocked" if self.blocked else self._result_state
+        names = {"idle": "stateIdle", "busy": "stateBusy", "success": "stateSuccess",
+                 "error": "stateError", "disconnected": "stateDisconnected", "blocked": "stateBlocked"}
+        self.state_value.setText("已屏蔽" if self.blocked else self._result_text)
+        self.state_value.setObjectName(names.get(state, "stateIdle"))
+        self.state_value.style().unpolish(self.state_value)
+        self.state_value.style().polish(self.state_value)
+        self.setProperty("cardState", state)
+        self.style().unpolish(self)
+        self.style().polish(self)
 
     # ── 能力辽标解析 ───────────────────────────────────────────────────────
 
@@ -504,7 +645,7 @@ class DeviceCard(QFrame):
                 button.setObjectName(target_name)
                 button.style().unpolish(button)
                 button.style().polish(button)
-            button.setEnabled(enabled if not stop_mode else is_active)
+            button.setEnabled(enabled and (not stop_mode or is_active))
 
     def set_running_state(
         self,
@@ -512,18 +653,10 @@ class DeviceCard(QFrame):
         running: bool,
         active_action: str | None = None,
     ) -> None:
-        self.state_value.setText(text)
-        self.state_value.setObjectName("stateBusy" if running else "stateIdle")
-        self.state_value.style().unpolish(self.state_value)
-        self.state_value.style().polish(self.state_value)
-        self.setProperty("cardState", "busy" if running else "idle")
-        self.style().unpolish(self)
-        self.style().polish(self)
-        self._set_action_button_mode(
-            stop_mode=running,
-            enabled=True,
-            active_action=active_action,
-        )
+        self._running, self._active_action = running, active_action
+        self._result_text, self._result_state = text, "busy" if running else "idle"
+        self._render_result_state()
+        self._sync_action_buttons()
         if running:
             self._process_output_buffer = ""
             self._last_stage_log = ""
@@ -533,21 +666,10 @@ class DeviceCard(QFrame):
             self.progress_bar.setFormat(f"{text} 0%")
 
     def set_result_state(self, text: str, state: str) -> None:
-        name_map = {
-            "idle": "stateIdle",
-            "success": "stateSuccess",
-            "error": "stateError",
-            "disconnected": "stateDisconnected",
-        }
-        self.state_value.setText(text)
-        self.state_value.setObjectName(name_map.get(state, "stateIdle"))
-        self.state_value.style().unpolish(self.state_value)
-        self.state_value.style().polish(self.state_value)
-        self.setProperty("cardState", state)
-        self.style().unpolish(self)
-        self.style().polish(self)
-        is_disconnected = state == "disconnected"
-        self._set_action_button_mode(stop_mode=False, enabled=not is_disconnected)
+        self._running, self._active_action = False, None
+        self._result_text, self._result_state = text, state
+        self._render_result_state()
+        self._sync_action_buttons()
         if state == "success":
             self.progress_bar.setValue(100)
             self.progress_bar.setFormat("完成 100%")
@@ -570,7 +692,7 @@ class DeviceCard(QFrame):
             self.append_log(f"[阶段] {text}")
 
     def set_newly_detected(self, is_new: bool) -> None:
-        self.new_badge.setVisible(is_new)
+        self.new_badge.setVisible(is_new and not self.blocked)
         previous = self.property("cardState")
         if is_new and previous == "idle":
             self.setProperty("cardState", "new")

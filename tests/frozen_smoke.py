@@ -39,7 +39,7 @@ for tool in ("esptool", "espefuse", "espsecure"):
     assert result.returncode == 0, checks[-1]
     assert tool in result.stdout.lower(), checks[-1]
 assert run(["__otool_qt_startup_smoke__"]).returncode == 0
-assert "5.4.0" in run(["esptool", "version"]).stdout
+assert "5.6.0" in run(["esptool", "version"]).stdout
 
 first, second, merged = (root / filename for filename in ("首段.bin", "second data.bin", "合并.bin"))
 first.write_bytes(b"FIRST")

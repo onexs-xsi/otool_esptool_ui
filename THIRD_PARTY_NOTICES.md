@@ -8,7 +8,7 @@ OTool Esptool UI 由 ONEXS 维护。分发本工具时请保留本文件，并�
 
 | 组件 | 构建版本 | 发布日期 | 用途 | 许可证 | 官方来源 |
 |---|---|---|---|---|---|
-| esptool | 5.4.0 | 2026-09-02 | 芯片识别、Flash 擦除/读写、eFuse 与安全相关操作 | GPL-2.0-or-later | [项目](https://github.com/espressif/esptool) / [版本](https://github.com/espressif/esptool/releases/tag/v5.4.0) |
+| esptool | 5.6.0 | 2026-10-15 | 芯片识别、Flash 擦除/读写、eFuse 与安全相关操作 | GPL-2.0-or-later | [项目](https://github.com/espressif/esptool) / [版本](https://github.com/espressif/esptool/releases/tag/v5.6.0) |
 | PyQt6 | 6.11.0 | 2026-03-30 | 桌面界面、窗口、控件、线程与进程事件集成 | GPL-3.0-only / Commercial | [项目](https://www.riverbankcomputing.com/software/pyqt/) / [版本](https://pypi.org/project/PyQt6/6.11.0/) |
 | pyserial | 3.5 | 2020-11-23 | 串口枚举、终端收发与自动校验串口访问 | BSD-3-Clause | [项目](https://github.com/pyserial/pyserial) / [版本](https://pypi.org/project/pyserial/3.5/) |
 | pyte | 0.8.2 | 2023-11-12 | Unix VTXXX/ANSI 终端控制序列解析与屏幕仿真 | LGPL-3.0-only | [项目](https://github.com/selectel/pyte) / [版本](https://pypi.org/project/pyte/0.8.2/) |
@@ -29,7 +29,7 @@ OTool Esptool UI 由 ONEXS 维护。分发本工具时请保留本文件，并�
 ## 版本与分发说明
 
 - 应用“引用说明”优先读取包元数据；元数据缺失时使用此构建清单。版本不同时不沿用旧版本发布日期。
-- esptool 固定到 v5.4.0，提交 `5ac7935ee036f64080a4b2f5cda6c9a6188ae93b`；源码子模块与安装包版本保持一致。
+- esptool 固定到 v5.6.0，提交 `e970488de2c8f1906ca9b08de681b3f9dc58b2d5`；源码子模块与安装包版本保持一致。
 - 完整运行依赖见 `requirements.txt`，完整构建依赖见 `requirements-build.txt`。
 - Qt 和 PyQt 的许可证独立于本项目 MIT 许可证；完整文本请查阅包内许可证和上游链接。
 - PyInstaller 是构建工具，其 bootloader exception 适用于所生成程序；hooks 中的独立授权以该项目说明为准。

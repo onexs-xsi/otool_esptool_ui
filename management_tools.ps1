@@ -10,6 +10,7 @@
     [switch]$Recreate,
     [switch]$SkipUpgradePip,
     [switch]$SkipDependencyInstall,
+    [string]$PackageDirectory = 'dist',
     [switch]$NoClean
 )
 
@@ -27,7 +28,10 @@ $Script:MainScript       = Join-Path $Script:ProjectRoot 'otool_esptool_ui.py'
 $Script:RequirementsFile = Join-Path $Script:ProjectRoot 'requirements.txt'
 $Script:BuildRequirementsFile = Join-Path $Script:ProjectRoot 'requirements-build.txt'
 $Script:SpecFile         = Join-Path $Script:ProjectRoot 'otool_esptool_ui.spec'
-$Script:PackageOutput    = Join-Path $Script:ProjectRoot 'dist\otool_esptool_ui.exe'
+if (-not [IO.Path]::IsPathRooted($PackageDirectory)) {
+    $PackageDirectory = Join-Path $Script:ProjectRoot $PackageDirectory
+}
+$Script:PackageOutput    = Join-Path $PackageDirectory 'otool_esptool_ui.exe'
 $Script:EsptoolDir       = Join-Path $Script:ProjectRoot 'esptool'
 
 $Script:KnownOnlineVersions = @('3.10.11', '3.11.9', '3.12.10', '3.13.2')
@@ -291,10 +295,12 @@ function Start-AppProcess {
     Ensure-EnvironmentPrerequisites
     if (-not (Test-Path $Script:VenvPython)) { throw '.venv not found. Initialize the environment first.' }
     Write-Step 'Starting application'
-    $proc = Start-Process -FilePath $Script:VenvPython `
-        -ArgumentList @($Script:MainScript) `
+    $appPython = Join-Path $Script:VenvDir 'Scripts\pythonw.exe'
+    if (-not (Test-Path $appPython)) { $appPython = $Script:VenvPython }
+    $proc = Start-Process -FilePath $appPython `
+        -ArgumentList @(('"{0}"' -f $Script:MainScript)) `
         -WorkingDirectory $Script:ProjectRoot `
-        -WindowStyle Hidden -PassThru
+        -WindowStyle Normal -PassThru
     Write-Step "Application started (PID $($proc.Id))"
 }
 
@@ -372,7 +378,7 @@ function Build-Package {
 
     $pyiArgs = @('-m', 'PyInstaller')
     if (-not $DisableCleanBuild) { $pyiArgs += '--clean' }
-    $pyiArgs += @('-y', $Script:SpecFile)
+    $pyiArgs += @('--distpath', (Split-Path -Parent $Script:PackageOutput), '-y', $Script:SpecFile)
 
     Invoke-CheckedExternal -FilePath $Script:VenvPython -Arguments $pyiArgs -Description 'Running PyInstaller'
 

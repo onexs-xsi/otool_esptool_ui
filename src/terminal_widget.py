@@ -10,7 +10,7 @@ from html import escape
 
 import serial
 from PyQt6.QtCore import QEvent, QThread, QTimer, QUrl, Qt, pyqtSignal
-from PyQt6.QtGui import QFont, QTextCursor
+from PyQt6.QtGui import QFont, QFontMetricsF, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -93,7 +94,9 @@ class TerminalSession:
     config: TerminalSerialConfig | None = None
     mode: str = "terminal"
     encoding: str = "utf-8"
-    newline: str = "\r\n"
+    newline_by_mode: dict[str, str] = field(
+        default_factory=lambda: {"terminal": "\r\n", "plain": "\r\n", "unix": "auto"}
+    )
     timestamp_enabled: bool = False
     hex_enabled: bool = False
     auto_follow: bool = True
@@ -448,6 +451,7 @@ class TerminalWidget(QWidget):
         self._log.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._log.setAttribute(Qt.WidgetAttribute.WA_InputMethodEnabled, True)
         self._log.installEventFilter(self)
+        self._log.viewport().installEventFilter(self)
         self._log.verticalScrollBar().valueChanged.connect(self._on_log_scroll_changed)
         mono = QFont()
         mono.setFamilies(["Consolas", "Menlo", "DejaVu Sans Mono", "monospace"])
@@ -503,7 +507,12 @@ class TerminalWidget(QWidget):
         self._newline_combo.addItem("CRLF", "\r\n")
         self._newline_combo.addItem("CR", "\r")
         self._newline_combo.addItem("不追加", "")
+        self._newline_combo.addItem("自动", "auto")
         self._newline_combo.setCurrentIndex(1)
+        self._newline_combo.setToolTip(
+            "自动：Unix 终端的 Enter 和粘贴换行使用单个 CR；其他模式使用 CRLF。\n"
+            "各会话分别记住每种模式的手动选择。"
+        )
         self._newline_combo.currentIndexChanged.connect(self._save_active_session_properties)
 
         input_header.addWidget(self._input_title)
@@ -558,6 +567,11 @@ class TerminalWidget(QWidget):
 
         self._input_stack.addWidget(terminal_input_page)
         self._input_stack.addWidget(plain_input_page)
+        for view in (self._log, self._terminal_input, self._plain_input):
+            view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            view.customContextMenuRequested.connect(
+                lambda point, view=view: self._show_terminal_menu(view, point)
+            )
 
         input_layout.addLayout(input_header)
         input_layout.addWidget(self._input_stack)
@@ -778,6 +792,8 @@ class TerminalWidget(QWidget):
         ports: list[tuple[str, str]] = []
         self._port_descriptions.clear()
         for port_info in list_ports.comports():
+            if self._port_registry.is_blocked(port_info):
+                continue
             device = port_info.device
             desc = port_info.description if port_info.description and port_info.description != "n/a" else "串口设备"
             self._port_descriptions[device.lower()] = desc
@@ -886,6 +902,10 @@ class TerminalWidget(QWidget):
             session = self._sessions[session_id]
         self._timer_for_session(session_id).stop()
         session.closing_requested = False
+        if self._port_registry.is_blocked(config.port):
+            self._set_session_status(session_id, "已屏蔽")
+            self._append_sys(f"{config.port} 已屏蔽，请从烧录台设备菜单解除屏蔽", session_id=session_id)
+            return
         lease = self._port_registry.acquire(
             config.port,
             owner=f"terminal:{session_id}",
@@ -980,7 +1000,7 @@ class TerminalWidget(QWidget):
             self._set_session_status(session_id, "监听中")
             return
         if not self._port_registry.is_available(config.port):
-            self._set_session_status(session_id, "串口忙")
+            self._set_session_status(session_id, "已屏蔽" if self._port_registry.is_blocked(config.port) else "串口忙")
             return
         self._append_sys(f"监听检测到 {config.port}，正在自动重连", session_id=session_id)
         self._start_serial_thread(config, session_id=session_id)
@@ -989,6 +1009,7 @@ class TerminalWidget(QWidget):
         target = port.lower()
         for port_info in list_ports.comports():
             if str(port_info.device).lower() == target:
+                self._port_registry.observe_device(port_info)
                 return True
         return False
 
@@ -1127,7 +1148,8 @@ class TerminalWidget(QWidget):
             return
         session.mode = self._current_mode()
         session.encoding = self._current_encoding()
-        session.newline = self._current_newline()
+        # Store the selection, including 'auto', rather than its resolved bytes.
+        session.newline_by_mode[session.mode] = self._selected_newline()
         session.timestamp_enabled = self._timestamp_check.isChecked()
         session.hex_enabled = self._hex_check.isChecked()
         session.auto_follow = self._auto_follow_btn.isChecked()
@@ -1207,6 +1229,8 @@ class TerminalWidget(QWidget):
         session = self._sessions.get(session_id)
         if session is None:
             return
+        if session_id != self._active_session_id:
+            self._log.moveCursor(QTextCursor.MoveOperation.Start)
         self._active_session_id = session_id
         self._records = session.records
         self._record_hex_overrides = session.record_hex_overrides
@@ -1219,7 +1243,7 @@ class TerminalWidget(QWidget):
         self._hex_check.setChecked(session.hex_enabled)
         self._auto_follow_btn.setChecked(session.auto_follow)
         self._encoding_combo.setCurrentText(session.encoding)
-        self._set_combo_data(self._newline_combo, session.newline)
+        self._set_combo_data(self._newline_combo, session.newline_by_mode[session.mode])
         if session.config is not None:
             self._select_port_text(session.config.port)
             self._baud_combo.setCurrentText(str(session.config.baudrate))
@@ -1317,6 +1341,13 @@ class TerminalWidget(QWidget):
 
     def _on_mode_changed(self) -> None:
         mode = self._current_mode()
+        session = self._active_session()
+        if session is not None and not self._updating_session_controls:
+            # Block the intermediate signal so a mode switch cannot save the
+            # previous mode's selection under the newly selected mode.
+            self._newline_combo.blockSignals(True)
+            self._set_combo_data(self._newline_combo, session.newline_by_mode[mode])
+            self._newline_combo.blockSignals(False)
         self._update_mode_input_ui(mode)
         self._save_active_session_properties()
         self._schedule_render()
@@ -1389,9 +1420,16 @@ class TerminalWidget(QWidget):
     def _current_encoding(self) -> str:
         return self._encoding_combo.currentText().strip() or "utf-8"
 
-    def _current_newline(self) -> str:
+    def _selected_newline(self) -> str:
         value = self._newline_combo.currentData()
-        return value if isinstance(value, str) else "\n"
+        return value if isinstance(value, str) else "\r\n"
+
+    def _current_newline(self) -> str:
+        """Resolve the input convention; RX line endings do not identify it."""
+        value = self._selected_newline()
+        if value == "auto":
+            return "\r" if self._current_mode() == "unix" else "\r\n"
+        return value
 
     def _send_terminal_line(self) -> None:
         text = self._terminal_input.toPlainText()
@@ -1441,8 +1479,13 @@ class TerminalWidget(QWidget):
         self._history_draft = ""
 
     def eventFilter(self, source, event) -> bool:
+        if source is self._log.viewport() and event.type() == QEvent.Type.Resize:
+            if event.size().width() != event.oldSize().width() and self._current_mode() == "unix":
+                self._schedule_render()
         if source is self._log and event.type() == QEvent.Type.KeyPress:
-            return self._handle_unix_terminal_key(event)
+            if self._current_mode() == "unix":
+                return self._handle_unix_terminal_key(event)
+            return self._handle_log_clipboard_key(event)
         if (
             source is self._log
             and event.type() == QEvent.Type.InputMethod
@@ -1458,6 +1501,13 @@ class TerminalWidget(QWidget):
             self._plain_input,
         ):
             key = event.key()
+            if event.modifiers() == (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier):
+                if key == Qt.Key.Key_V:
+                    source.paste()
+                    return True
+                if key == Qt.Key.Key_C:
+                    source.copy()
+                    return True
             if source is self._terminal_input and key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
                 self._send_terminal_line()
                 return True
@@ -1467,22 +1517,30 @@ class TerminalWidget(QWidget):
                 return self._navigate_send_history(source, 1)
         return super().eventFilter(source, event)
 
+    def _handle_log_clipboard_key(self, event) -> bool:
+        ctrl = Qt.KeyboardModifier.ControlModifier
+        shift = Qt.KeyboardModifier.ShiftModifier
+        key, modifiers = event.key(), event.modifiers()
+        if (key == Qt.Key.Key_V and modifiers in (ctrl, ctrl | shift)) or (
+            key == Qt.Key.Key_Insert and modifiers == shift
+        ):
+            self._paste_from_log()
+            return True
+        if (
+            key == Qt.Key.Key_C
+            and (modifiers == (ctrl | shift) or (modifiers == ctrl and self._current_mode() != "unix"))
+        ) or (key == Qt.Key.Key_Insert and modifiers == ctrl):
+            self._copy_log_selection()
+            return True
+        return False
+
     def _handle_unix_terminal_key(self, event) -> bool:
         if self._current_mode() != "unix":
             return False
+        if self._handle_log_clipboard_key(event):
+            return True
         key = event.key()
         modifiers = event.modifiers()
-        control = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
-        shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
-        if control and shift and key == Qt.Key.Key_C:
-            self._log.copy()
-            return True
-        if (control and key == Qt.Key.Key_V) or (
-            shift and key == Qt.Key.Key_Insert
-        ):
-            self._paste_unix_terminal()
-            return True
-
         encoding = self._current_encoding()
         try:
             data = encode_unix_key(
@@ -1509,6 +1567,56 @@ class TerminalWidget(QWidget):
             return
         self._send_text(normalize_pasted_text(text, self._current_newline()))
         self._log.setFocus()
+
+    def _paste_from_log(self) -> None:
+        mode = self._current_mode()
+        if mode == "unix":
+            self._paste_unix_terminal()
+            return
+        editor = self._plain_input if mode == "plain" else self._terminal_input
+        editor.setFocus()
+        editor.paste()
+
+    def _copy_log_selection(self) -> None:
+        cursor = self._log.textCursor()
+        if cursor.hasSelection():
+            QApplication.clipboard().setText(cursor.selection().toPlainText())
+
+    def _show_terminal_menu(self, view, point) -> None:
+        menu = self._terminal_menu(view)
+        try:
+            menu.exec(view.viewport().mapToGlobal(point))
+        finally:
+            menu.deleteLater()
+
+    def _terminal_menu(self, view) -> QMenu:
+        menu = QMenu(self)
+        selected = view.textCursor().hasSelection()
+        has_text = not view.document().isEmpty()
+        if view is self._log:
+            unix = self._current_mode() == "unix"
+            copy_key = "Ctrl+Shift+C" if unix else "Ctrl+C"
+            menu.addAction(f"复制选中内容\t{copy_key}", self._copy_log_selection).setEnabled(selected)
+            menu.addAction("复制全部日志", self._copy_all).setEnabled(has_text)
+            menu.addAction("全选日志", view.selectAll).setEnabled(has_text)
+            menu.addSeparator()
+            session = self._active_session()
+            can_paste = bool(QApplication.clipboard().text()) and (
+                not unix or (session is not None and session.serial_thread is not None)
+            )
+            label = "粘贴并发送到串口" if unix else "粘贴到发送框"
+            menu.addAction(f"{label}\tCtrl+V", self._paste_from_log).setEnabled(can_paste)
+            menu.addSeparator()
+            menu.addAction("清空日志", self._clear_log).setEnabled(has_text)
+        else:
+            menu.addAction("撤销\tCtrl+Z", view.undo).setEnabled(view.document().isUndoAvailable())
+            menu.addAction("重做\tCtrl+Y", view.redo).setEnabled(view.document().isRedoAvailable())
+            menu.addSeparator()
+            menu.addAction("剪切\tCtrl+X", view.cut).setEnabled(selected)
+            menu.addAction("复制\tCtrl+C", view.copy).setEnabled(selected)
+            menu.addAction("粘贴\tCtrl+V", view.paste).setEnabled(view.canPaste())
+            menu.addAction("全选\tCtrl+A", view.selectAll).setEnabled(has_text)
+        return menu
 
     def _send_unix_quick_bytes(self, data: bytes) -> None:
         self._send_bytes(data)
@@ -1616,11 +1724,20 @@ class TerminalWidget(QWidget):
         previous_value = scrollbar.value()
         previous_max = scrollbar.maximum()
         should_follow = self._auto_follow_btn.isChecked() or self._is_log_at_bottom()
+        cursor = self._log.textCursor()
+        anchor, position = cursor.anchor(), cursor.position()
+        selection = cursor.selectedText()
         self._updating_log_scroll = True
         if is_html:
             self._log.setHtml(text)
         else:
             self._log.setPlainText(text)
+        if selection and max(anchor, position) < self._log.document().characterCount():
+            cursor = self._log.textCursor()
+            cursor.setPosition(anchor)
+            cursor.setPosition(position, QTextCursor.MoveMode.KeepAnchor)
+            if cursor.selectedText() == selection:
+                self._log.setTextCursor(cursor)
         if should_follow:
             self._scroll_log_to_bottom()
         else:
@@ -1642,11 +1759,7 @@ class TerminalWidget(QWidget):
         self._set_log_scroll_value(min(previous_value, self._log.verticalScrollBar().maximum()))
 
     def _scroll_log_to_bottom(self) -> None:
-        cursor = self._log.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        self._log.setTextCursor(cursor)
         self._set_log_scroll_value(self._log.verticalScrollBar().maximum())
-        self._log.ensureCursorVisible()
 
     def _set_log_scroll_value(self, value: int) -> None:
         scrollbar = self._log.verticalScrollBar()
@@ -1685,6 +1798,9 @@ class TerminalWidget(QWidget):
             session = self._active_session()
             if session is None:
                 return self._build_html_page(""), True
+            viewport = self._log.viewport()
+            text_width = viewport.width() - 2 * self._log.document().documentMargin()
+            cell_width = QFontMetricsF(self._log.font(), viewport).horizontalAdvance("M")
             session.unix_terminal.sync(
                 (
                     (record.record_id, record.payload)
@@ -1692,6 +1808,7 @@ class TerminalWidget(QWidget):
                     if record.direction == "RX"
                 ),
                 self._current_encoding(),
+                columns=max(1, int(text_width / cell_width)),
             )
             return (
                 self._build_html_page(session.unix_terminal.render_html()),
@@ -1794,7 +1911,7 @@ class TerminalWidget(QWidget):
     def _build_html_page(self, body: str) -> str:
         return (
             "<html><body>"
-            "<pre style=\"font-family: Consolas, Menlo, monospace; "
+            "<pre style=\"font-family: Consolas, Menlo, 'DejaVu Sans Mono', monospace; "
             "font-size: 10pt; color: #d1d5db; white-space: pre;\">"
             f"{body}"
             "</pre></body></html>"

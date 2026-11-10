@@ -41,14 +41,14 @@ _COMPONENT_SPECS: tuple[_ComponentSpec, ...] = (
     _ComponentSpec(
         name="esptool",
         distribution="esptool",
-        baseline_version="5.4.0",
-        release_date="2026-09-02",
+        baseline_version="5.6.0",
+        release_date="2026-10-15",
         purpose="芯片识别、Flash 擦除/读写、eFuse 与安全相关操作",
         license_name="GPL-2.0-or-later",
         source_url="https://github.com/espressif/esptool",
-        release_url="https://github.com/espressif/esptool/releases/tag/v5.4.0",
+        release_url="https://github.com/espressif/esptool/releases/tag/v5.6.0",
         scope="核心运行组件",
-        version_detail="Git 标签 v5.4.0 · commit 5ac7935e",
+        version_detail="Git 标签 v5.6.0 · commit e970488d",
     ),
     _ComponentSpec(
         name="PyQt6",

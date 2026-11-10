@@ -61,6 +61,24 @@ class UnixTerminalEmulatorTests(unittest.TestCase):
         self.assertIn("background-color:#d1d5db", html)
         self.assertIn("outline:1px solid #e5e7eb", html)
 
+    def test_resize_reflows_scrollback_and_keeps_partial_utf8_and_ansi_state(self) -> None:
+        emulator = UnixTerminalEmulator(columns=5, lines=2)
+        records = [(1, b"abcdefghij\r\nnext\r\n\x1b[31m\xe4")]
+        emulator.sync(records, "utf-8")
+        self.assertGreater(len(emulator.screen.history.top), 0)
+
+        emulator.sync(records, "utf-8", columns=15)
+        records.append((2, b"\xb8\xad\x1b[0m"))
+        emulator.sync(records, "utf-8", columns=15)
+        self.assertIn("abcdefghij", emulator.render_html())
+        self.assertEqual([s.rstrip() for s in emulator.screen.display], ["next", "中"])
+        self.assertEqual(emulator.screen.buffer[1][0].fg, "red")
+
+        emulator.sync(records, "utf-8", columns=5)
+        html = emulator.render_html()
+        self.assertIn("abcde\nfghij\nnext", html)
+        self.assertEqual(html.count("中"), 1)
+
 
 class UnixTerminalKeyTests(unittest.TestCase):
     def test_printable_control_and_navigation_keys_use_terminal_sequences(self) -> None:

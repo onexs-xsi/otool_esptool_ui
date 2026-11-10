@@ -36,7 +36,7 @@ esp-pylib==1.1.5
     #   -c requirements.txt
     #   otool-esptool-ui (pyproject.toml)
     #   esptool
-esptool==5.4.0
+esptool==5.6.0
     # via
     #   -c requirements.txt
     #   otool-esptool-ui (pyproject.toml)

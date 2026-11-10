@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import codecs
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 from html import escape
 
 import pyte
@@ -183,7 +183,9 @@ class UnixTerminalEmulator:
     def reset(self) -> None:
         self._reset_screen(self._encoding or "utf-8")
 
-    def sync(self, records: Iterable[tuple[int, bytes]], encoding: str) -> None:
+    def sync(
+        self, records: Iterable[tuple[int, bytes]], encoding: str, *, columns: int | None = None
+    ) -> None:
         entries = tuple(records)
         record_ids = tuple(record_id for record_id, _payload in entries)
         normalized_encoding = encoding.strip() or "utf-8"
@@ -192,7 +194,11 @@ class UnixTerminalEmulator:
             and record_ids[: len(self._processed_record_ids)]
             == self._processed_record_ids
         )
-        if normalized_encoding != self._encoding or not prefix_matches:
+        new_columns = self.columns if columns is None else max(1, columns)
+        if new_columns != self.columns or normalized_encoding != self._encoding or not prefix_matches:
+            # Replay the retained RX stream so soft wraps reflow and explicit
+            # line breaks, VT sequences and incremental decoder state survive.
+            self.columns = new_columns
             self._reset_screen(normalized_encoding)
 
         start = len(self._processed_record_ids)
@@ -238,7 +244,7 @@ class UnixTerminalEmulator:
 
     def _render_line(
         self,
-        line: Mapping[int, pyte.screens.Char],
+        line: pyte.screens.StaticDefaultDict[int, pyte.screens.Char],
         cursor_column: int | None,
         show_cursor: bool,
     ) -> str:
@@ -253,7 +259,13 @@ class UnixTerminalEmulator:
             css = self._style_css(current_style)
             groups.append(f'<span style="{css}">{text}</span>' if css else text)
 
-        for column in range(self._screen.columns):
+        # Avoid scanning unused cells in every scrollback row on wide displays.
+        # A styled default (e.g. reverse video) still paints the whole row.
+        columns = self._screen.columns
+        if line.default == pyte.screens.Char(" "):
+            last_used = max(max(line, default=0), cursor_column or 0)
+            columns = min(columns, last_used + 1)
+        for column in range(columns):
             char = line[column]
             cursor = show_cursor and cursor_column == column
             style = (

@@ -31,7 +31,7 @@ else:
 # ── 应用信息（单一来源：otool_esptool_ui.py）─────────────────────────────────
 
 _DEFAULT_TITLE = "OTool Esptool UI | byonexs."
-_DEFAULT_VERSION = "0.6.15"
+_DEFAULT_VERSION = "0.6.23"
 _DEFAULT_AUTHOR = "ONEXS"
 
 
@@ -148,20 +148,25 @@ _CHIP_ARG_MAP = [
     ("esp32-s31", "esp32s31"),
     ("esp32-s3", "esp32s3"),
     ("esp32-s2", "esp32s2"),
+    ("esp32-c61", "esp32c61"),
     ("esp32-c6", "esp32c6"),
     ("esp32-c5", "esp32c5"),
     ("esp32-c3", "esp32c3"),
     ("esp32-c2", "esp32c2"),
+    ("esp32-h21", "esp32h21"),
     ("esp32-h2", "esp32h2"),
+    ("esp32-h4", "esp32h4"),
+    ("esp32-e22", "esp32e22"),
+    ("esp8266", "esp8266"),
     ("esp32",    "esp32"),
 ]
 
 
 def resolve_chip_arg(chip_name: str) -> str:
     """将 DeviceInfo.chip_name 映射为 esptool/espefuse 的 ``--chip`` 参数值。"""
-    name = (chip_name or "").lower()
+    name = (chip_name or "").lower().replace("-", "")
     for key, val in _CHIP_ARG_MAP:
-        if key in name:
+        if key.replace("-", "") in name:
             return val
     return "auto"
 
@@ -243,8 +248,8 @@ def _resolve_build_timestamp_text() -> str:
             return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M")
         except OSError:
             return "未知时间"
-    # 开发环境：源码 mtime 随 git clone / 文件拷贝变化，不可靠
-    return "开发版本"
+    # 源码版不显示文件复制时间，明确标示运行方式。
+    return "Python 版"
 
 
 @lru_cache(maxsize=1)

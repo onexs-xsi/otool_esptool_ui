@@ -10,6 +10,9 @@ venv/
 .mypy_cache/
 .pytest_cache/
 
+# 本地测试截图、构建日志和验证报告
+tests/evidence/
+
 build/
 dist/
 *.egg-info/

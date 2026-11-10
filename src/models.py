@@ -14,3 +14,6 @@ class DeviceInfo:
     connected: bool = True
     serial_number: str = ""
     hwid: str = ""
+    vid: int | None = None
+    pid: int | None = None
+    location: str = ""

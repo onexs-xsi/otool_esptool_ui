@@ -10,7 +10,7 @@ For package usage::
 
 import sys
 
-__version__ = "0.6.15"
+__version__ = "0.6.23"
 __author__ = "ONEXS"
 __title__ = "OTool Esptool UI | byonexs."
 

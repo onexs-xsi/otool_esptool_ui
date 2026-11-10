@@ -695,6 +695,8 @@ class BurnEfuseBatchWidget(QWidget):
     def _poll_ports(self) -> None:
         current_ports: dict[str, tuple[str, str]] = {}
         for pi in list_ports.comports():
+            if self._port_registry.is_blocked(pi):
+                continue
             if pi.description and re.search(r"通信端口|Communications Port", pi.description):
                 continue
             description = pi.description or "串口设备"
@@ -1136,6 +1138,7 @@ class BurnEfuseBatchWidget(QWidget):
         return (
             task in self._tasks
             and self._present_transports.get(task.port) == task.transport_id
+            and not self._port_registry.is_blocked(task.port)
         )
 
     def _record_irreversible_transport_loss(

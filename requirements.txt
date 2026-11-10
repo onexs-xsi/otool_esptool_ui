@@ -24,7 +24,7 @@ esp-pylib==1.1.5
     # via
     #   otool-esptool-ui (pyproject.toml)
     #   esptool
-esptool==5.4.0
+esptool==5.6.0
     # via otool-esptool-ui (pyproject.toml)
 intelhex==2.3.0
     # via
