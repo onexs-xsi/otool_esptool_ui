@@ -11,10 +11,10 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtCore import QAbstractAnimation
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtCore import QAbstractAnimation, QTimer
+from PyQt6.QtWidgets import QApplication, QDialog
 
-from src.app_update import EXECUTABLE_NAME, RELEASE_ROOT, UpdateError, download_release, parse_release
+from src.app_update import EXECUTABLE_NAME, RELEASE_ROOT, PreparedUpdate, UpdateError, download_release, parse_release
 from src.device_policy import DevicePolicyStore
 from src.main_window import OtoolEsptoolUI
 from src.update_dialog import ReleaseUpdateDialog
@@ -40,6 +40,20 @@ def release_payload(tag: str = "v0.6.100") -> dict:
 
 
 class ReleaseDownloadTests(unittest.TestCase):
+    def test_cancel_preserves_the_committed_handoff(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            (directory / "ready").touch()
+            process = Mock()
+            process.poll.return_value = None
+            prepared = PreparedUpdate(directory, process)
+
+            prepared.commit()
+            prepared.cancel()
+
+            process.terminate.assert_not_called()
+            self.assertTrue((directory / "commit").is_file())
+
     def test_stable_versions_are_compared_numerically(self):
         self.assertEqual(parse_release(release_payload(), "0.6.99").version, "0.6.100")
         for tag in ("v0.6.9", "v0.6.99", "v0.7.0-rc.1", "v0.7.0/other"):
@@ -128,6 +142,43 @@ class ReleaseWindowTests(unittest.TestCase):
                     self.assertTrue(window.isVisible())
                     update.commit.assert_not_called()
             finally:
+                window.close()
+                window.deleteLater()
+                self.app.processEvents()
+
+    def test_update_dialog_accepts_before_qt_quits(self):
+        with tempfile.TemporaryDirectory() as folder, patch(
+            "serial.tools.list_ports.comports", return_value=[]
+        ), patch("src.main_window._fetch_remote_avatar_bytes"):
+            directory = Path(folder)
+            (directory / "ready").touch()
+            process = Mock()
+            process.poll.return_value = None
+            finished = []
+
+            class ReadyDialog(ReleaseUpdateDialog):
+                def __init__(self, *args):
+                    super().__init__(*args)
+                    self._prepared = PreparedUpdate(directory, process)
+                    self.finished.connect(finished.append)
+                    QTimer.singleShot(0, self._check_installer)
+
+            window = OtoolEsptoolUI(DevicePolicyStore())
+            timeout = QTimer(window)
+            timeout.setSingleShot(True)
+            timeout.timeout.connect(lambda: self.app.exit(1))
+            try:
+                window.show()
+                window._show_release_update(parse_release(release_payload(), "0.6.24"))
+                with patch("src.main_window.ReleaseUpdateDialog", ReadyDialog):
+                    timeout.start(3000)
+                    QTimer.singleShot(0, window.release_update_button.click)
+                    self.assertEqual(self.app.exec(), 0)
+                self.assertEqual(finished, [QDialog.DialogCode.Accepted])
+                self.assertTrue((directory / "commit").is_file())
+                process.terminate.assert_not_called()
+            finally:
+                timeout.stop()
                 window.close()
                 window.deleteLater()
                 self.app.processEvents()

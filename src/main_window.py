@@ -1506,18 +1506,18 @@ class OtoolEsptoolUI(QMainWindow):
             self._available_release, self._update_blocked_reason,
             self._close_for_release_update, arguments, self,
         )
-        dialog.exec()
+        result = dialog.exec()
         dialog.deleteLater()
-        if self.isVisible():
+        if result == QDialog.DialogCode.Accepted:
+            # Qt closes any remaining dialogs on quit. Let the handoff finish first.
+            QApplication.instance().quit()
+        elif self.isVisible():
             self.release_update_button.setFocus()
 
     def _close_for_release_update(self, update: PreparedUpdate) -> str:
         self._prepared_update = update
         try:
-            if self.close():
-                QApplication.instance().quit()
-                return ""
-            return self._update_close_error
+            return "" if self.close() else self._update_close_error
         finally:
             self._prepared_update = None
 

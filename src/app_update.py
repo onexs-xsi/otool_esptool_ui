@@ -183,6 +183,9 @@ class PreparedUpdate:
         (self.directory / "commit").touch(exist_ok=False)
 
     def cancel(self) -> None:
+        # A committed helper owns the staging directory until it finishes.
+        if (self.directory / "commit").is_file():
+            return
         try:
             if self.process.poll() is None:
                 self.process.terminate()
