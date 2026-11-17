@@ -3,7 +3,9 @@ import os
 import re
 import subprocess
 import sys
+from http.client import HTTPException
 from pathlib import Path
+from threading import Thread
 
 from PyQt6.QtCore import (
     QEasingCurve,
@@ -52,6 +54,7 @@ from PyQt6.QtWidgets import (
 )
 from serial.tools import list_ports
 
+from .app_update import PreparedUpdate, Release, UpdateError, acknowledge_updated_startup, check_for_release
 from .constants import (
     APP_AUTHOR,
     APP_GITHUB_URL,
@@ -105,6 +108,7 @@ from .reference_components import (
 )
 from .styles import BASE_STYLESHEET
 from .terminal_widget import TerminalWidget
+from .update_dialog import NewReleaseButton, ReleaseUpdateDialog
 from .verify_widget import VerifyWidget
 
 
@@ -502,9 +506,14 @@ class FlashEntryRow(QWidget):
 
 class OtoolEsptoolUI(QMainWindow):
     _avatar_ready = pyqtSignal(bytes)
+    _release_found = pyqtSignal(object)
 
     def __init__(self, policy_store: DevicePolicyStore | None = None) -> None:
         super().__init__()
+        self._available_release: Release | None = None
+        self._prepared_update: PreparedUpdate | None = None
+        self._update_close_error = ""
+        self._release_found.connect(self._show_release_update)
         self.device_cards: dict[str, DeviceCard] = {}
         self.device_infos: dict[str, DeviceInfo] = {}
         self.new_device_ids: set[str] = set()
@@ -861,6 +870,8 @@ class OtoolEsptoolUI(QMainWindow):
         panel_layout.setContentsMargins(8, 6, 8, 6)
         panel_layout.setSpacing(6)
 
+        self.release_update_button = NewReleaseButton(self.floating_info_panel)
+        self.release_update_button.clicked.connect(self._open_release_update)
         self.version_badge = QLabel(f"v{APP_VERSION} · {_resolve_build_timestamp_text()}")
         self.version_badge.setObjectName("floatingMetaPrimary")
         self.version_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -886,6 +897,7 @@ class OtoolEsptoolUI(QMainWindow):
         self._avatar_ready.connect(self._update_github_icon)
         _fetch_remote_avatar_bytes(self._avatar_ready.emit)
 
+        panel_layout.addWidget(self.release_update_button)
         panel_layout.addWidget(self.version_badge)
         panel_layout.addWidget(self.author_badge)
         panel_layout.addWidget(self.floating_info_divider)
@@ -933,13 +945,15 @@ class OtoolEsptoolUI(QMainWindow):
             self.floating_tab_panel.move(margin, y)
             self.floating_tab_panel.raise_()
         if hasattr(self, "floating_info_panel") and hasattr(self, "floating_tab_panel"):
+            info_width = self.floating_info_panel.width()
+            if self.release_update_button.isHidden():
+                info_width += self.release_update_button.width() + self.floating_info_panel.layout().spacing()
             stacked = (
-                self.floating_tab_panel.width() + self.floating_info_panel.width()
-                + 3 * margin > central.width()
+                self.floating_tab_panel.width() + info_width + 3 * margin > central.width()
             )
             self._footer.setFixedHeight(112 if stacked else 62)
             if stacked:
-                self.floating_info_panel.move(margin, 50)
+                self.floating_info_panel.move(self.floating_info_panel.x(), 50)
 
     def _position_floating_info_panel(self) -> None:
         self._position_floating_panels()
@@ -1465,6 +1479,47 @@ class OtoolEsptoolUI(QMainWindow):
 
     def show_reference_notice(self) -> None:
         ReferenceNoticeDialog(self).exec()
+
+    def check_for_release_update(self) -> None:
+        def check() -> None:
+            try:
+                release = check_for_release()
+                if release is not None:
+                    self._release_found.emit(release)
+            except (OSError, HTTPException, ValueError, UpdateError, RuntimeError):
+                # GitHub availability must not affect the workbench at startup.
+                pass
+
+        Thread(target=check, daemon=True, name="release-check").start()
+
+    def _show_release_update(self, release: Release) -> None:
+        self._available_release = release
+        self.release_update_button.setToolTip(f"查看 {release.tag} 更新说明")
+        self.release_update_button.show()
+        self._position_floating_panels()
+
+    def _open_release_update(self) -> None:
+        if self._available_release is None:
+            return
+        arguments = ["--tab", str(self.tab_switcher.current())]
+        dialog = ReleaseUpdateDialog(
+            self._available_release, self._update_blocked_reason,
+            self._close_for_release_update, arguments, self,
+        )
+        dialog.exec()
+        dialog.deleteLater()
+        if self.isVisible():
+            self.release_update_button.setFocus()
+
+    def _close_for_release_update(self, update: PreparedUpdate) -> str:
+        self._prepared_update = update
+        try:
+            if self.close():
+                QApplication.instance().quit()
+                return ""
+            return self._update_close_error
+        finally:
+            self._prepared_update = None
 
     def auto_pick_firmware(self) -> None:
         if not self._flash_rows or self._flash_rows[0].path_edit.text().strip():
@@ -3127,50 +3182,77 @@ class OtoolEsptoolUI(QMainWindow):
                     return True
         return super().eventFilter(source, event)
 
-    def closeEvent(self, event) -> None:
-        if self._efuse_batch_widget.has_irreversible_operation():
-            QMessageBox.warning(
-                self,
-                "eFuse 操作尚未完成",
-                "设备正在执行不可逆 eFuse 烧录或结果验证。为避免设备状态未知，"
-                "请等待任务完成后再退出。",
-            )
-            event.ignore()
-            return
-        running = [c for did, c in self.device_cards.items()
-                   if c.process is not None or did in self._pending_retries]
-        background_count = (
-            self._efuse_batch_widget.active_task_count()
+    def _active_work_count(self) -> int:
+        running = sum(c.process is not None or did in self._pending_retries for did, c in self.device_cards.items())
+        return (
+            running
+            + self._efuse_batch_widget.active_task_count()
             + self._verify_widget.active_task_count()
             + self._terminal_widget.active_connection_count()
             + int(self._merge_split_widget.has_active_device_read())
             + int(self._merge_split_widget.has_active_merge())
         )
-        total_active = len(running) + background_count
-        if total_active:
-            reply = QMessageBox.question(
-                self,
-                "确认退出",
-                f"有 {total_active} 个串口任务或连接仍在运行，确定停止并退出吗？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if reply != QMessageBox.StandardButton.Yes:
+
+    def _update_blocked_reason(self) -> str:
+        if self._efuse_batch_widget.has_irreversible_operation():
+            return "请等待 eFuse 操作或结果验证完成后再更新。"
+        active = self._active_work_count()
+        if active:
+            return f"还有 {active} 个任务或串口连接。请完成任务并断开连接后再更新。"
+        return ""
+
+    def closeEvent(self, event) -> None:
+        update = self._prepared_update
+        if update is not None:
+            self._update_close_error = self._update_blocked_reason()
+            if self._update_close_error:
                 event.ignore()
                 return
+        else:
+            if self._efuse_batch_widget.has_irreversible_operation():
+                QMessageBox.warning(
+                    self,
+                    "eFuse 操作尚未完成",
+                    "设备正在执行不可逆 eFuse 烧录或结果验证。为避免设备状态未知，"
+                    "请等待任务完成后再退出。",
+                )
+                event.ignore()
+                return
+            total_active = self._active_work_count()
+            if total_active:
+                reply = QMessageBox.question(
+                    self,
+                    "确认退出",
+                    f"有 {total_active} 个串口任务或连接仍在运行，确定停止并退出吗？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    event.ignore()
+                    return
         main_stopped = self.stop_all_devices()
         self._efuse_batch_widget._stop_all()
         verify_stopped = self._verify_widget.shutdown()
         terminal_stopped = self._terminal_widget.shutdown()
         split_stopped = self._merge_split_widget.shutdown()
         if not (main_stopped and verify_stopped and terminal_stopped and split_stopped):
-            QMessageBox.warning(
-                self,
-                "后台任务尚未退出",
-                "仍有后台串口线程或进程未在安全等待时间内结束，请稍后重试退出。",
-            )
+            if update is not None:
+                self._update_close_error = "后台任务尚未退出，请稍后重试更新。"
+            else:
+                QMessageBox.warning(
+                    self,
+                    "后台任务尚未退出",
+                    "仍有后台串口线程或进程未在安全等待时间内结束，请稍后重试退出。",
+                )
             event.ignore()
             return
+        if update is not None:
+            try:
+                update.commit()
+            except (OSError, UpdateError):
+                self._update_close_error = "无法交接给 Windows 更新程序，请重试。"
+                event.ignore()
+                return
         super().closeEvent(event)
 
     def keyPressEvent(self, event) -> None:
@@ -3267,4 +3349,6 @@ def main() -> int:
         except Exception:
             pass
 
+    QTimer.singleShot(0, lambda: acknowledge_updated_startup(sys.argv))
+    QTimer.singleShot(250, window.check_for_release_update)
     return app.exec()

@@ -1,6 +1,6 @@
 # OTool Esptool UI
 
-> ESP 烧录 / eFuse / 串口校验 / 固件分合 / 多会话终端 · v0.6.23
+> ESP 烧录 / eFuse / 串口校验 / 固件分合 / 多会话终端 · v0.7.1
 
 OTool Esptool UI 是面向 Windows 的 ESP 桌面工作台，基于 PyQt6 与 esptool，提供五个工作台和可独立运行的单文件 EXE。多设备任务共享串口占用管理，避免不同工作台同时打开同一个串口。
 
@@ -83,6 +83,7 @@ Unix 模式提供 ANSI/VT 屏幕仿真、方向键和控制键、直接键盘输
 
 - 小屏或高 DPI 下工作区自动提供滚动，底部导航保持可见；窄窗口下导航与版本信息分两行。
 - “引用说明”显示实际组件版本、上游发布日期和来源；无需联网即可查看构建清单。
+- 应用启动后检查 GitHub Releases。发现更高的正式版时，版本号左侧显示 `NEW!`。可先阅读更新说明，或下载安装并自动重启。源码运行时可在发布页下载 Windows 版。
 - `config.yaml` 保存 eFuse 预设与 `verify_profiles`；示例见 `esp32p4_burn_efuse_config_example.yaml`。
 - 源码运行时读取项目内配置；单文件 EXE 使用构建时嵌入的默认配置；校验台优先读取 EXE 旁的 `config.yaml`，运行中也可通过界面导入 YAML。
 - 默认查找程序附近的 `firmware` 目录；可使用 `OTOOL_ESPTOOL_UI_FIRMWARE_DIR` 指定固件目录。
@@ -132,6 +133,16 @@ python -m venv .venv
 本次使用自动回归、模拟串口、离线固件和实际 EXE 验证；**未连接真实 ESP 设备**。真实 USB 热插拔时序、芯片复位、Flash 擦写结果、板级串口行为及 eFuse 写后结果尚需设备验证。详细结果见 [本次检查记录](review_20261003.md)。
 
 ## Changelog
+
+### v0.7.1
+
+- 在 GitHub Releases 正式提供支持应用内升级的 Windows 单文件版。v0.6.24 可通过版本号左侧的 `NEW!` 升级到此版本。
+- 收录设备自动烧录、按 MAC 查询烧录历史和阶段耗时、多会话串口终端等工作台改进。
+
+### v0.6.24
+
+- 新增 GitHub 正式版检查、`NEW!` 更新入口和更新说明。
+- Windows 单文件版校验 GitHub 的 SHA-256 和 EXE 版本后原位升级，保留上一版备份。安装目录需要额外权限时使用 Windows UAC。
 
 ### v0.6.23
 

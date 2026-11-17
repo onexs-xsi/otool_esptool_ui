@@ -31,7 +31,7 @@ else:
 # ── 应用信息（单一来源：otool_esptool_ui.py）─────────────────────────────────
 
 _DEFAULT_TITLE = "OTool Esptool UI | byonexs."
-_DEFAULT_VERSION = "0.6.23"
+_DEFAULT_VERSION = "0.7.1"
 _DEFAULT_AUTHOR = "ONEXS"
 
 
@@ -56,12 +56,13 @@ APP_TITLE = _ENTRY_META.get("title", _DEFAULT_TITLE)
 APP_VERSION = _ENTRY_META.get("version", _DEFAULT_VERSION)
 APP_VERSION_WIN = APP_VERSION + ".0" if APP_VERSION.count(".") == 2 else APP_VERSION
 APP_AUTHOR = _ENTRY_META.get("author", _DEFAULT_AUTHOR)
+RELEASE_REPOSITORY = "onexs-xsi/otool_esptool_ui"
 APP_GITHUB_URL = (
     os.environ.get(
         "OTOOL_ESPTOOL_UI_GITHUB_URL",
-        "https://github.com/onexs-xsi/otool_esptool_ui",
+        f"https://github.com/{RELEASE_REPOSITORY}",
     ).strip()
-    or "https://github.com/onexs-xsi/otool_esptool_ui"
+    or f"https://github.com/{RELEASE_REPOSITORY}"
 )
 
 

@@ -95,4 +95,38 @@ QPushButton:disabled {
     color: #b0b8cd;
     border-color: #e8eaef;
 }
+
+/* GitHub release prompt */
+QPushButton#releaseUpdateButton {
+    background: #ffe4f0;
+    border: 1px solid #e8abc5;
+    border-radius: 14px;
+    padding: 0;
+    color: #89204d;
+    font-size: 11px;
+    font-weight: 700;
+}
+QPushButton#releaseUpdateButton:hover {
+    background: #ffd5e7;
+    border-color: #cf79a1;
+}
+QPushButton#releaseUpdateButton:pressed {
+    background: #f9bfd9;
+}
+QPushButton#releaseUpdateButton:focus {
+    border: 2px solid #932052;
+}
+QLabel#releaseVersion {
+    font-size: 17px;
+    font-weight: 700;
+}
+QLabel#releaseStatus {
+    color: #4b5970;
+}
+QTextBrowser#releaseNotes {
+    background: #ffffff;
+    border: 1px solid #d8e0eb;
+    border-radius: 8px;
+    padding: 8px;
+}
 """

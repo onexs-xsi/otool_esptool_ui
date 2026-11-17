@@ -16,8 +16,13 @@ The business brief is the user's device-card request dated 2026-11-11. README.md
 | Recent firmware sources | FirmwareHistoryStore + FlashEntryRow.browse_menu | User supplement dated 2026-11-11, README.md | bin files and build directories share one 16-item MRU | tests/test_firmware_history.py |
 | Device burn history | FlashHistoryStore + FlashHistoryPanel + HistoryDeviceCard | User history request dated 2026-11-11, DESIGN.md | MAC groups, search and expandable attempts in the burn-page sidebar | tests/test_flash_history_ui.py; desktop screenshots |
 | Phase duration | FlashRunTimer + bootstrap.instrument_esptool_phases + PhaseDurationBar | Actual esptool loader calls | Same recording for manual, global and per-port automatic flash attempts | tests/test_flash_history_ui.py |
+| Release update | NewReleaseButton + ReleaseUpdateDialog + apply_update.ps1 | GitHub Releases and current user request | Windows standalone EXE can replace itself. Source runs link to the release page. | tests/test_app_update.py and Windows EXE replacement |
 
 This is a native PyQt6 application, with no web router, browser forms, web date picker, server paging, or remote CRUD lifecycle in the touched workflow. Native Qt accessibility and keyboard controls apply.
+
+## Release update flow
+
+Check the official GitHub repository once the workbench is visible. A higher stable release reveals “NEW!” beside the current version. “以后再说” closes the dialog and leaves the same release available for the session. “开始更新” downloads and validates the release asset before requesting the existing safe shutdown. Active work or serial connections keep the application open and show the reason. A separate PowerShell helper waits for the application and its bootloader to exit, replaces the executable and reopens the selected workbench. Only a Windows access-denied result triggers UAC for file replacement. The helper keeps the previous executable as a backup and attempts to restore it if the new process exits before the workbench is ready.
 
 ## Device preference flow
 

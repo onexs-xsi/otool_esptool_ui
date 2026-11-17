@@ -10,6 +10,8 @@ colors:
   auto: "#7c3aed"
   blocked: "#6b7280"
   on-status: "#ffffff"
+  release-fill: "#ffe4f0"
+  release-text: "#89204d"
 typography:
   sans:
     fontFamily: "Microsoft YaHei UI, Segoe UI, sans-serif"
@@ -98,3 +100,9 @@ FlashHistoryPanel and HistoryDeviceCard in src/flash_history_widget.py are the c
 Collapsed history cards use four compact rows: chip model followed immediately by “-” and the complete, selectable MAC with the result badge at the far right; start time, port, attempt count and elapsed seconds; proportional duration bar; firmware tooltip and detail toggle. Keep 10px horizontal insets, 8px top / 7px bottom insets, 4px internal gaps and 6px between cards. MAC uses 11px Consolas and is never truncated or moved to a separate row. Expanded details retain the per-attempt timeline and three-column phase figures without overlapping adjacent cards.
 
 PHASES in src/flash_timing.py owns the phase order, Chinese labels and colors: gray preparation, blue connection, amber erase, violet write, teal verify, cyan reset, slate finish. A 10px proportional bar displays aggregated measured durations. Hovering any segment shows its name, seconds, percentage and total; its accessible name exposes phase durations and keyboard focus has a visible outline. Expanded attempts use a compact three-column legend. Colors supplement phase/result text. Actual esptool method boundaries and monotonic clocks determine duration; waiting for removal and retry backoff are excluded. Production entry points load only real local records and show an honest empty state when no records exist. Synthetic sample generators and screenshot previews live exclusively under tests/.
+
+## GitHub release update
+
+The `NEW!` button sits immediately before the version badge inside the existing footer panel. The 62 × 28 logical-pixel pill uses the release colors from `src/styles.py`. Keep the other badges right-aligned when it appears and account for its width when stacking the footer on narrow windows. Three small bursts play once for 2.4 seconds inside the pill when it first becomes visible. Use the Windows client-area animation preference.
+
+`ReleaseUpdateDialog` uses the workbench's standard Qt modal and primary action styling. Show the version pair, scrollable release notes and a fixed progress area. Focus “以后再说” on open and restore focus to the footer button on dismissal. Keep GitHub navigation separate from the release notes, which render Markdown with resource loading disabled.
