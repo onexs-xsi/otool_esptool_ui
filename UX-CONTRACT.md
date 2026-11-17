@@ -22,6 +22,8 @@ This is a native PyQt6 application, with no web router, browser forms, web date 
 
 ## Release update flow
 
+On Windows, keep the workbench transparent through its first paint. Confirm restart readiness and schedule the release check after revealing the window.
+
 Check the official GitHub repository once the workbench is visible. A higher stable release reveals “NEW!” beside the current version. “以后再说” closes the dialog and leaves the same release available for the session. “开始更新” downloads and validates the release asset before requesting the existing safe shutdown. Active work or serial connections keep the application open and show the reason. A separate PowerShell helper waits for the application and its bootloader to exit, replaces the executable and reopens the selected workbench. Only a Windows access-denied result triggers UAC for file replacement. The helper keeps the previous executable as a backup and attempts to restore it if the new process exits before the workbench is ready.
 
 ## Device preference flow

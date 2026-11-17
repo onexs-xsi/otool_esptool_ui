@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
+import subprocess
+import sys
 import unittest
 import threading
 import re
@@ -10,17 +13,60 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtWidgets import QApplication, QStyleOptionFrame, QStyle
+from src.device_policy import DevicePolicyStore
 from src.main_window import OtoolEsptoolUI, ReferenceNoticeDialog
 from src.verify_visual_editor import _DownComboBox
-from PyQt6.QtCore import QByteArray, QBuffer, QIODevice
+from PyQt6.QtCore import QByteArray, QBuffer, QIODevice, QTimer
 from PyQt6.QtGui import QImage, QColor
 from PyQt6.QtTest import QTest
+
+
+def _record_startup_order() -> None:
+    app = QApplication([])
+    events = []
+
+    class ObservedWindow(OtoolEsptoolUI):
+        def paintEvent(self, event):
+            events.append("paint")
+            super().paintEvent(event)
+            if self._startup_reveal_timer.isActive():
+                events.append(["timer", self._startup_reveal_timer.interval()])
+
+    with patch("serial.tools.list_ports.comports", return_value=[]), patch(
+        "src.main_window._fetch_remote_avatar_bytes"
+    ), patch("src.main_window.acknowledge_updated_startup", side_effect=lambda _: events.append("ready")):
+        window = ObservedWindow(DevicePolicyStore())
+        with patch("src.main_window.sys.platform", "win32"), patch.object(
+            window, "setWindowOpacity", side_effect=events.append
+        ):
+            window._startup_reveal_timer.timeout.connect(app.quit)
+            QTimer.singleShot(0, window.show_for_startup)
+            QTimer.singleShot(5000, lambda: app.exit(1))
+            if app.exec() != 0:
+                raise RuntimeError(f"The main window did not become ready: {events}")
+    print(json.dumps(events))
 
 
 class SmallWindowAccessTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
+
+    def test_windows_startup_reveals_the_main_window_after_its_first_paint(self):
+        # Other tests close the shared QApplication to verify the update handoff.
+        # Start this test in a fresh GUI process, as a real launch would.
+        result = subprocess.run(
+            [sys.executable, "-c", "import sys; sys.path.insert(0, 'tests'); "
+             "from test_window_accessibility import _record_startup_order; _record_startup_order()"],
+            cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=12,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = json.loads(result.stdout)
+        self.assertEqual(events[0], 0.0)
+        self.assertLess(events.index("paint"), events.index(["timer", 0]))
+        self.assertLess(events.index(["timer", 0]), events.index(1.0))
+        self.assertLess(events.index(1.0), events.index("ready"))
+        self.assertEqual(events.count("ready"), 1)
 
     def test_stylesheet_assets_exist_outside_the_source_directory(self):
         with tempfile.TemporaryDirectory(prefix="独立 目录 ") as directory, patch(

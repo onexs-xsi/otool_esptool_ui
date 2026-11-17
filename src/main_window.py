@@ -514,6 +514,9 @@ class OtoolEsptoolUI(QMainWindow):
         self._prepared_update: PreparedUpdate | None = None
         self._update_close_error = ""
         self._release_found.connect(self._show_release_update)
+        self._startup_reveal_timer = QTimer(self)
+        self._startup_reveal_timer.setSingleShot(True)
+        self._startup_reveal_timer.timeout.connect(self._finish_startup)
         self.device_cards: dict[str, DeviceCard] = {}
         self.device_infos: dict[str, DeviceInfo] = {}
         self.new_device_ids: set[str] = set()
@@ -1467,6 +1470,27 @@ class OtoolEsptoolUI(QMainWindow):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._position_floating_panels()
+
+    def show_for_startup(self) -> None:
+        if sys.platform == "win32":
+            self.setWindowOpacity(0.0)
+            self._startup_reveal_timer.start(1500)  # Fallback for a minimized launch.
+        else:
+            self._startup_reveal_timer.start(0)
+        self.show()
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if self._startup_reveal_timer.isActive() and self._startup_reveal_timer.interval() > 0:
+            # The next event-loop turn runs after Qt finishes painting this frame.
+            self._startup_reveal_timer.start(0)
+
+    def _finish_startup(self) -> None:
+        if sys.platform == "win32":
+            self.setWindowOpacity(1.0)
+        if self.isVisible():
+            acknowledge_updated_startup(sys.argv)
+            QTimer.singleShot(250, self.check_for_release_update)
 
     def open_github_url(self) -> None:
         if not QDesktopServices.openUrl(QUrl(APP_GITHUB_URL)):
@@ -3310,7 +3334,6 @@ def main() -> int:
     if screen is not None:
         available = screen.availableGeometry().size() - QSize(24, 48)
         window.resize(window.size().boundedTo(available))
-    window.show()
 
     # Windows Jump List：向任务栏注册快捷任务（任务对应 --tab 参数切换页面）
     setup_jump_list(
@@ -3349,6 +3372,5 @@ def main() -> int:
         except Exception:
             pass
 
-    QTimer.singleShot(0, lambda: acknowledge_updated_startup(sys.argv))
-    QTimer.singleShot(250, window.check_for_release_update)
+    window.show_for_startup()
     return app.exec()
