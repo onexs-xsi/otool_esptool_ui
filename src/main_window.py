@@ -49,8 +49,10 @@ from PyQt6.QtWidgets import (
     QStackedWidget,
     QSplitter,
     QTextBrowser,
+    QToolButton,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
 from serial.tools import list_ports
 
@@ -409,7 +411,9 @@ class FlashEntryRow(QWidget):
         self.browse_btn.setFixedWidth(70)
         self.browse_menu = QMenu(self.browse_btn)
         self.browse_menu.setToolTipsVisible(True)
+        self.browse_menu.installEventFilter(self)
         self.browse_menu.aboutToShow.connect(self._populate_browse_menu)
+        self.browse_menu.hovered.connect(self._highlight_history_source)
         self.browse_btn.setMenu(self.browse_menu)
         self._populate_browse_menu()
 
@@ -456,13 +460,63 @@ class FlashEntryRow(QWidget):
             while limit > 12 and metrics.horizontalAdvance(text) > HISTORY_LABEL_MAX_WIDTH:
                 limit -= 1
                 text = prefix + shorten_source_path(source, limit)
-            action = menu.addAction(text.replace("&", "&&"))
+            action = QWidgetAction(menu)
+            action.setText(text.replace("&", "&&"))
             action.setData({"kind": source.kind, "path": source.path})
-            action.setToolTip(source.path if source.available else f"{source.path}\n路径已不存在，请重新选择。")
-            action.setEnabled(source.available)
-            action.triggered.connect(lambda checked=False, item=source: self._use_history_source(item))
+            available = source.available
+            action.setToolTip(source.path if available else f"{source.path}\n路径已不存在，请重新选择。")
+            entry = QWidget()
+            layout = QHBoxLayout(entry)
+            layout.setContentsMargins(3, 0, 4, 0)
+            layout.setSpacing(2)
+            remove = QToolButton()
+            remove.setObjectName("forgetFirmwareButton")
+            remove.setText("×")
+            remove.setAutoRaise(True)
+            remove.setCursor(Qt.CursorShape.PointingHandCursor)
+            remove.setFixedSize(24, 24)
+            remove.setAccessibleName(f"移除最近使用记录 {source.path}")
+            remove.setToolTip(f"移除这条使用记录（Delete）\n{source.path}")
+            remove.clicked.connect(lambda checked=False, item=source: self._forget_source(item))
+            open_source = QPushButton(action.text())
+            open_source.setObjectName("recentFirmwareButton")
+            open_source.setFlat(True)
+            open_source.setEnabled(available)
+            open_source.setAccessibleName(source.path)
+            open_source.setToolTip(action.toolTip())
+            open_source.clicked.connect(action.trigger)
+            if available:
+                open_source.setCursor(Qt.CursorShape.PointingHandCursor)
+                action.triggered.connect(lambda checked=False, item=source: self._use_history_source(item))
+            layout.addWidget(remove)
+            layout.addWidget(open_source, 1)
+            action.setDefaultWidget(entry)
+            menu.addAction(action)
+
+    def _highlight_history_source(self, active) -> None:
+        for action in self.browse_menu.actions():
+            if isinstance(action, QWidgetAction):
+                button = action.defaultWidget().findChild(QPushButton)
+                button.setDown(action == active)
+
+    def eventFilter(self, watched, event):
+        if watched is self.browse_menu and event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Delete:
+            action = self.browse_menu.activeAction()
+            if isinstance(action, QWidgetAction):
+                self._forget_source(FirmwareSource(**action.data()))
+                return True
+        return super().eventFilter(watched, event)
+
+    def _forget_source(self, source: FirmwareSource) -> None:
+        try:
+            self._history.forget(source)
+        except OSError as exc:
+            QMessageBox.warning(self, "移除使用记录失败", f"{source.path}\n{exc}")
+            return
+        self._populate_browse_menu()
 
     def _use_history_source(self, source: FirmwareSource) -> None:
+        self.browse_menu.close()
         if source.kind == "build":
             self.build_import_requested.emit(source.path)
         else:
@@ -1330,6 +1384,21 @@ class OtoolEsptoolUI(QMainWindow):
                 background: #f5f5f5;
                 border-color: #e0e0e0;
                 color: #c0c0c0;
+            }
+            QPushButton#recentFirmwareButton, QToolButton#forgetFirmwareButton {
+                background: transparent;
+                border: 0;
+                border-radius: 4px;
+                padding: 2px 4px;
+                font-weight: normal;
+            }
+            QPushButton#recentFirmwareButton { text-align: left; }
+            QPushButton#recentFirmwareButton:hover, QPushButton#recentFirmwareButton:pressed,
+            QPushButton#recentFirmwareButton:focus { background: #dce8ff; }
+            QToolButton#forgetFirmwareButton:hover, QToolButton#forgetFirmwareButton:focus,
+            QToolButton#forgetFirmwareButton:pressed {
+                background: #fee2e2;
+                color: #991b1b;
             }
             QPushButton#addEntryButton {
                 background: #f0f5ff;

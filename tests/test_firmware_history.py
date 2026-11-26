@@ -9,7 +9,9 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtCore import QPoint, Qt
+from PyQt6.QtTest import QTest
+from PyQt6.QtWidgets import QApplication, QPushButton, QToolButton
 
 from src.firmware_history import FirmwareHistoryStore, FirmwareSource, shorten_source_path, HISTORY_LABEL_MAX_WIDTH
 from src.main_window import FlashEntryRow, OtoolEsptoolUI
@@ -89,9 +91,56 @@ class FirmwareHistoryUITests(unittest.TestCase):
                 self.assertEqual(received, [str(build)])
                 firmware.unlink()
                 row._populate_browse_menu()
-                self.assertFalse(row.browse_menu.actions()[3].isEnabled())
+                missing = row.browse_menu.actions()[3].defaultWidget()
+                self.assertFalse(missing.findChild(QPushButton).isEnabled())
+                self.assertTrue(missing.findChild(QToolButton).isEnabled())
                 self.assertIn("路径已不存在", row.browse_menu.actions()[3].toolTip())
             finally:
+                row.deleteLater()
+
+    def test_recent_source_buttons_forget_records_without_selecting_or_deleting_files(self):
+        with tempfile.TemporaryDirectory(prefix="otool-history-") as directory:
+            root = Path(directory)
+            firmware = root / "firmware.bin"
+            firmware.write_bytes(b"firmware")
+            build = root / "build"
+            build.mkdir()
+            manifest = build / "flasher_args.json"
+            manifest.write_text("{}")
+            history = FirmwareHistoryStore(root / "history.json")
+            history.remember("bin", firmware)
+            history.remember("build", build)
+            manifest.unlink()
+            row = FlashEntryRow("0x1000", str(firmware), history=history)
+            menu = row.browse_menu
+            activations = []
+            row.firmware_used.connect(activations.append)
+            row.build_import_requested.connect(activations.append)
+            try:
+                menu.popup(QPoint(5, 5))
+                self.app.processEvents()
+                missing = menu.actions()[3].defaultWidget()
+                remove = missing.findChild(QToolButton)
+                self.assertLess(remove.geometry().right(), missing.findChild(QPushButton).geometry().left())
+                with (patch("src.firmware_history.os.replace", side_effect=OSError("read only")),
+                      patch("src.main_window.QMessageBox.warning") as warning):
+                    QTest.mouseClick(remove, Qt.MouseButton.LeftButton)
+                    warning.assert_called_once()
+                self.assertEqual(len(FirmwareHistoryStore(history.path).entries), 2)
+                self.assertEqual(len(history.entries), 2)
+                QTest.mouseClick(remove, Qt.MouseButton.LeftButton)
+                self.assertTrue(menu.isVisible())
+                self.assertEqual(history.entries, [FirmwareSource("bin", str(firmware))])
+                menu.setActiveAction(menu.actions()[3])
+                QTest.keyClick(menu, Qt.Key.Key_Delete)
+                self.assertEqual(menu.actions()[-1].text(), "暂无使用记录")
+                self.assertFalse(FirmwareHistoryStore(history.path).entries)
+                self.assertTrue(build.is_dir())
+                self.assertEqual(firmware.read_bytes(), b"firmware")
+                self.assertEqual((row.addr_edit.text(), row.path_edit.text()), ("0x1000", str(firmware)))
+                self.assertEqual(activations, [])
+            finally:
+                menu.close()
                 row.deleteLater()
 
     def test_build_history_reuses_import_and_bin_selection_updates_mru_across_rows(self):

@@ -8,6 +8,15 @@ from src.unix_terminal import UnixTerminalEmulator, encode_unix_key, normalize_p
 
 
 class UnixTerminalEmulatorTests(unittest.TestCase):
+    def test_local_clear_preserves_partial_input_during_replay(self) -> None:
+        emulator = UnixTerminalEmulator(columns=20, lines=4)
+        records = [(1, b"old\r\n" * 15 + b"\x1b[3"), (2, None), (3, b"1m\xe4"), (4, None), (5, b"\xb8\xad")]
+        for columns in (20, 12):
+            emulator.sync(records, "utf-8", columns=columns)
+            self.assertNotIn("old", emulator.render_html())
+            self.assertEqual(emulator.visible_text().strip(), "中")
+            self.assertEqual(emulator.screen.buffer[0][0].fg, "red")
+
     def test_top_refresh_sequences_replace_the_visible_screen(self) -> None:
         emulator = UnixTerminalEmulator(columns=80, lines=24)
         first_frame = (

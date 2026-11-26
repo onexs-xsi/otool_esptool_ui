@@ -59,14 +59,15 @@ class FlowLayout(QLayout):
                 continue
             hint = item.sizeHint()
             iw, ih = hint.width(), hint.height()
-            next_x = x + iw + self._h_spacing
-            if next_x - self._h_spacing > eff.x() + eff.width() and line_height > 0:
+            right_edge = eff.x() + eff.width()
+            if x + iw > right_edge and line_height > 0:
                 x = eff.x()
                 y += line_height + self._v_spacing
-                next_x = x + iw + self._h_spacing
                 line_height = 0
+            if item.alignment() & Qt.AlignmentFlag.AlignRight:
+                x = max(x, right_edge - iw)
             if not test_only:
                 item.setGeometry(QRect(QPoint(x, y), hint))
-            x = next_x
+            x += iw + self._h_spacing
             line_height = max(line_height, ih)
         return y + line_height - rect.y() + m.bottom()

@@ -72,7 +72,14 @@ class FirmwareHistoryStore:
         key = os.path.normcase(entry.path)
         entries = [entry] + [item for item in self.entries
                              if item.kind != kind or os.path.normcase(item.path) != key]
-        entries = entries[:self.limit]
+        self._save(entries[:self.limit])
+
+    def forget(self, source: FirmwareSource) -> None:
+        entries = [item for item in self.entries if item != source]
+        if len(entries) != len(self.entries):
+            self._save(entries)
+
+    def _save(self, entries: list[FirmwareSource]) -> None:
         if self.path is not None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             temporary = None

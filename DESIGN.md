@@ -66,6 +66,8 @@ Keep 12px card corners, 7px buttons, and 4px badges. The corner ribbon is delibe
 
 ## Components
 
+The first terminal configuration row groups mode, port with Refresh, and baud rate. The second starts at the left with data bits, parity, stop bits, flow control, and the TERM selector. Each row wraps its own fields. Connect sits immediately left of Listen in the right-aligned group that ends with Full screen.
+
 - DeviceTitleLabel owns measured name omission, full tooltip, and accessible name; ordinary metadata continues to use ElidedLabel.
 - DeviceCard.menu_button is a keyboard-operable QToolButton with a three-line SVG icon, hover/pressed/focus states, accessible name, and tooltip. Both it and the name support the same context menu.
 - QMenu owns keyboard navigation, checked states, submenu placement to the right when space permits, Escape, and focus restoration. The first item is 屏蔽 with 按端口屏蔽 / 按设备屏蔽; the second is checkable 自动烧录.
@@ -90,6 +92,8 @@ The existing card status and progress text show “失败，10 秒后重试” d
 The completed card retains its success tone and 100% progress while showing the compact status “成功，待移除” and progress text “烧录完成，请拔出设备”. A chip-information probe runs on a 3-second timer and reads the actual chip MAC; an enumerated USB adapter is not evidence that its attached chip is present. Two consecutive no-response results confirm chip removal. Port contention or unexpected tool errors leave the state unchanged. Split operator messages into short readable log lines within the existing fixed-width card. Confirmed removal changes the status to “就绪，待接入” and progress text to “已就绪，等待下一台设备接入”; keep that card and its log visible. Continue probing for the next chip and reuse the station's card/log rather than adding an unbounded list of completed cards.
 
 FlashEntryRow extends its existing QMenu: the two picker commands stay first, followed by a real separator and up to 16 recent sources in most-recent-use order. Prefix each source with bin or build. Bound labels to 56 characters and 420 logical pixels; use six middle asterisks and preserve the parent directory and filename/model tail when possible. Full paths remain in tooltips. Missing files/build manifests are disabled with an explanation. Reuse Qt popup collision, keyboard, focus and checked-state behavior rather than adding a custom overlay.
+
+Each recent source has a compact × button at the left of its path. Missing sources keep this button available while their path appears disabled.
 
 ## Device history and phase timing
 

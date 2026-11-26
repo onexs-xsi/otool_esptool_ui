@@ -85,6 +85,33 @@ class TerminalSerialReviewTests(unittest.TestCase):
         self.assertEqual(delivered, b"abcdefg")
         sink.flush.assert_called_once()
 
+    def test_driver_failure_rolls_back_partial_settings_between_transmissions(self) -> None:
+        original = self.thread._config
+        wanted = TerminalSerialConfig(original.port, 9600, 7, "E", 2, "rtscts")
+        applied = original.serial_settings()
+        events = []
+        sink = MagicMock()
+
+        def apply(settings):
+            applied.update(settings)
+            if applied["bytesize"] == 7:
+                raise serial.SerialException("unsupported")
+
+        def write(data):
+            events.append((data, applied.copy()))
+            return len(data)
+
+        sink.apply_settings.side_effect = apply
+        sink.write.side_effect = write
+        self.thread._serial = sink
+        self.thread.send(b"before")
+        self.thread.request_settings(wanted)
+        self.thread.send(b"after")
+        self.thread._drain_send_queue()
+        self.assertEqual(events, [(b"before", original.serial_settings()), (b"after", original.serial_settings())])
+        self.assertEqual(sink.apply_settings.call_count, 2)
+        sink.close.assert_not_called()
+
     def test_zero_progress_raises_instead_of_silently_losing_payload(self) -> None:
         sink = MagicMock()
         sink.write.return_value = 0

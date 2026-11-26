@@ -184,7 +184,7 @@ class UnixTerminalEmulator:
         self._reset_screen(self._encoding or "utf-8")
 
     def sync(
-        self, records: Iterable[tuple[int, bytes]], encoding: str, *, columns: int | None = None
+        self, records: Iterable[tuple[int, bytes | None]], encoding: str, *, columns: int | None = None
     ) -> None:
         entries = tuple(records)
         record_ids = tuple(record_id for record_id, _payload in entries)
@@ -203,6 +203,12 @@ class UnixTerminalEmulator:
 
         start = len(self._processed_record_ids)
         for _record_id, payload in entries[start:]:
+            if payload is None:
+                # Replay a local Ctrl+L in order, keeping the decoder and VT
+                # parser alive even when an RX sequence straddles the keypress.
+                self._screen.erase_in_display(3)
+                self._screen.cursor_position()
+                continue
             decoded = self._decoder.decode(payload, final=False)
             if decoded:
                 self._stream.feed(decoded)
@@ -212,6 +218,9 @@ class UnixTerminalEmulator:
         return "\n".join(self._screen.display)
 
     def render_html(self, show_cursor: bool = True) -> str:
+        return "\n".join(self.render_html_lines(show_cursor))
+
+    def render_html_lines(self, show_cursor: bool = True) -> list[str]:
         history = list(self._screen.history.top)
         screen_lines = [self._screen.buffer[row] for row in range(self._screen.lines)]
         cursor_row = len(history) + self._screen.cursor.y
@@ -224,7 +233,11 @@ class UnixTerminalEmulator:
                     show_cursor=show_cursor and not self._screen.cursor.hidden,
                 )
             )
-        return "\n".join(rendered)
+        # An auto-following, short viewport would otherwise scroll the prompt
+        # off the top to display unused rows below it after a clear.
+        while len(rendered) > cursor_row + 1 and not rendered[-1].strip():
+            rendered.pop()
+        return rendered
 
     def _reset_screen(self, encoding: str) -> None:
         try:

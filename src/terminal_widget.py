@@ -9,7 +9,7 @@ from datetime import datetime
 from html import escape
 
 import serial
-from PyQt6.QtCore import QEvent, QThread, QTimer, QUrl, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QObject, QThread, QThreadPool, QTimer, QUrl, Qt, pyqtSignal
 from PyQt6.QtGui import QFont, QFontMetricsF, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
@@ -32,6 +32,7 @@ from PyQt6.QtWidgets import (
 )
 from serial.tools import list_ports
 
+from .flow_layout import FlowLayout
 from .port_ownership import GLOBAL_PORT_OWNERSHIP, PortLease, PortOwnershipRegistry
 from .styles import BASE_STYLESHEET
 from .terminal_decode import decode_payload_chunks
@@ -65,6 +66,18 @@ ENCODING_OPTIONS = [
 CUSTOM_PORT_DATA = "__custom_port__"
 CUSTOM_PORT_LABEL = "自定义串口..."
 
+_SHELL_TERM_TYPES = ("xterm-256color", "xterm", "vt100", "vt102", "linux")
+# Run the probe in a subshell so its helper and variables stay out of the
+# operator's shell. Keep the command ASCII for devices using legacy locales.
+_SHELL_TERM_PROBE = (
+    '(echo "TERM=$TERM"; '
+    'if command -v infocmp >/dev/null; then check() { infocmp "$1"; }; '
+    'elif command -v tput >/dev/null; then check() { tput -T "$1" cup 0 0; }; '
+    'else echo "infocmp / tput unavailable"; exit 1; fi; '
+    f'for t in {" ".join(_SHELL_TERM_TYPES)}; do '
+    'if check "$t" >/dev/null 2>&1; then echo "+ $t"; else echo "- $t"; fi; done)'
+)
+
 
 @dataclass(frozen=True)
 class TerminalSerialConfig:
@@ -75,6 +88,13 @@ class TerminalSerialConfig:
     stopbits: float
     flow_control: str
 
+    def serial_settings(self) -> dict:
+        return dict(
+            baudrate=self.baudrate, bytesize=self.bytesize, parity=self.parity,
+            stopbits=self.stopbits, xonxoff=self.flow_control == "xonxoff",
+            rtscts=self.flow_control == "rtscts", dsrdtr=self.flow_control == "dsrdtr",
+        )
+
 
 @dataclass
 class TerminalLogRecord:
@@ -83,6 +103,7 @@ class TerminalLogRecord:
     timestamp: datetime
     payload: bytes = b""
     message: str = ""
+    clears_unix_display: bool = False
 
 
 @dataclass
@@ -92,8 +113,10 @@ class TerminalSession:
     description: str
     status: str = "未连接"
     config: TerminalSerialConfig | None = None
+    pending_config: TerminalSerialConfig | None = None
     mode: str = "terminal"
     encoding: str = "utf-8"
+    last_sent_term: str = ""
     newline_by_mode: dict[str, str] = field(
         default_factory=lambda: {"terminal": "\r\n", "plain": "\r\n", "unix": "auto"}
     )
@@ -121,18 +144,39 @@ def _format_hex(data: bytes) -> str:
     return " ".join(f"{byte:02X}" for byte in data)
 
 
+class _TerminalPortScan(QObject):
+    finished = pyqtSignal(object, str)
+
+    def run(self) -> None:
+        try:
+            ports = list(list_ports.comports())
+        except Exception as exc:
+            self.finished.emit([], str(exc))
+        else:
+            self.finished.emit(ports, "")
+
+
+class _TerminalPortCombo(QComboBox):
+    opening = pyqtSignal()
+
+    def showPopup(self) -> None:
+        self.opening.emit()
+        super().showPopup()
+
+
 class TerminalSerialThread(QThread):
     opened = pyqtSignal(str)
     data_received = pyqtSignal(bytes)
     error = pyqtSignal(str)
     closed = pyqtSignal()
+    settings_applied = pyqtSignal(object, object, str)
 
     def __init__(self, config: TerminalSerialConfig, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._config = config
         self._stop_event = threading.Event()
         self._reset_requested = threading.Event()
-        self._send_queue: queue.Queue[bytes] = queue.Queue()
+        self._send_queue: queue.Queue[bytes | TerminalSerialConfig] = queue.Queue()
         self._serial: serial.Serial | None = None
 
     def request_stop(self) -> None:
@@ -144,6 +188,9 @@ class TerminalSerialThread(QThread):
     def send(self, data: bytes) -> None:
         if data:
             self._send_queue.put(data)
+
+    def request_settings(self, config: TerminalSerialConfig) -> None:
+        self._send_queue.put(config)
 
     def run(self) -> None:
         try:
@@ -161,21 +208,27 @@ class TerminalSerialThread(QThread):
             self.closed.emit()
 
     def _open_serial(self) -> serial.Serial:
-        xonxoff = self._config.flow_control == "xonxoff"
-        rtscts = self._config.flow_control == "rtscts"
-        dsrdtr = self._config.flow_control == "dsrdtr"
         return serial.Serial(
             port=self._config.port,
-            baudrate=self._config.baudrate,
-            bytesize=self._config.bytesize,
-            parity=self._config.parity,
-            stopbits=self._config.stopbits,
+            **self._config.serial_settings(),
             timeout=0.03,
             write_timeout=1,
-            xonxoff=xonxoff,
-            rtscts=rtscts,
-            dsrdtr=dsrdtr,
         )
+
+    def _apply_settings(self, requested: TerminalSerialConfig) -> None:
+        assert self._serial is not None
+        try:
+            self._serial.apply_settings(requested.serial_settings())
+        except (OSError, ValueError, OverflowError) as exc:
+            # pySerial may have applied earlier fields before a driver rejects one.
+            try:
+                self._serial.apply_settings(self._config.serial_settings())
+            except (OSError, ValueError, OverflowError) as rollback_error:
+                raise serial.SerialException(f"参数更改失败且无法恢复：{rollback_error}") from exc
+            self.settings_applied.emit(requested, self._config, str(exc))
+        else:
+            self._config = requested
+            self.settings_applied.emit(requested, requested, "")
 
     def _read_write_loop(self) -> None:
         assert self._serial is not None
@@ -211,6 +264,9 @@ class TerminalSerialThread(QThread):
                 data = self._send_queue.get_nowait()
             except queue.Empty:
                 break
+            if isinstance(data, TerminalSerialConfig):
+                self._apply_settings(data)
+                continue
             written = 0
             while written < len(data) and not self._stop_event.is_set():
                 count = self._serial.write(data[written:])
@@ -255,6 +311,16 @@ class TerminalWidget(QWidget):
         self._next_session_id = 1
         self._active_session_id: int | None = None
         self._port_descriptions: dict[str, str] = {}
+        self._port_snapshot: list[tuple[str, str]] | None = None
+        self._latest_ports: list[tuple[str, str]] = []
+        self._enumerated_ports: set[str] = set()
+        self._port_scan = _TerminalPortScan()
+        self._port_scan.finished.connect(self._port_scan_finished)
+        self._scan_running = False
+        self._announce_scan = False
+        self._port_timer = QTimer(self)
+        self._port_timer.setInterval(5000)
+        self._port_timer.timeout.connect(self._request_port_scan)
         self._reconnect_timers: dict[int, QTimer] = {}
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
@@ -264,13 +330,15 @@ class TerminalWidget(QWidget):
         self._history_index: int | None = None
         self._history_draft = ""
         self._updating_log_scroll = False
+        self._unix_html_lines: list[str] | None = None
         self._updating_session_controls = False
         self._fullscreen_restore_geometry = None
         self._fullscreen_restore_state = None
         self._init_ui()
         self._apply_style()
         self._new_session()
-        QTimer.singleShot(0, self.refresh_ports)
+        self._port_timer.start()
+        QTimer.singleShot(0, self._request_port_scan)
 
     def _init_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -328,10 +396,14 @@ class TerminalWidget(QWidget):
         header.addWidget(self._clear_btn)
 
         self._serial_config_widget = QWidget()
-        grid = QGridLayout(self._serial_config_widget)
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setHorizontalSpacing(8)
-        grid.setVerticalSpacing(6)
+        config_rows = QVBoxLayout(self._serial_config_widget)
+        config_rows.setContentsMargins(0, 0, 0, 0)
+        config_rows.setSpacing(6)
+        port_row = FlowLayout(h_spacing=12, v_spacing=6)
+        settings_row = FlowLayout(h_spacing=12, v_spacing=6)
+        for row in (port_row, settings_row):
+            row.setContentsMargins(0, 0, 0, 0)
+            config_rows.addLayout(row)
 
         self._mode_combo = QComboBox()
         self._mode_combo.addItem("标准终端", "terminal")
@@ -344,10 +416,16 @@ class TerminalWidget(QWidget):
         )
         self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
 
-        self._port_combo = QComboBox()
+        self._port_combo = _TerminalPortCombo()
+        self._port_combo.opening.connect(self._apply_port_list)
         self._port_combo.setEditable(True)
         self._port_combo.setMinimumWidth(180)
+        self._port_combo.setMaximumWidth(360)
+        self._port_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self._port_combo.addItem(CUSTOM_PORT_LABEL, CUSTOM_PORT_DATA)
+        self._port_combo.setEditText("")
         self._port_combo.currentIndexChanged.connect(self._on_port_index_changed)
+        self._port_combo.currentTextChanged.connect(self._port_combo.setToolTip)
         self._port_combo.currentTextChanged.connect(self._save_active_session_properties)
         self._refresh_btn = QPushButton("刷新")
         self._refresh_btn.clicked.connect(self.refresh_ports)
@@ -357,12 +435,13 @@ class TerminalWidget(QWidget):
         for baud in TERMINAL_BAUD_OPTIONS:
             self._baud_combo.addItem(baud)
         self._baud_combo.setCurrentText("115200")
-        self._baud_combo.currentTextChanged.connect(self._save_active_session_properties)
+        self._baud_combo.activated.connect(self._commit_serial_settings)
+        self._baud_combo.lineEdit().editingFinished.connect(self._commit_serial_settings)
 
         self._bytesize_combo = QComboBox()
         for value in (8, 7, 6, 5):
             self._bytesize_combo.addItem(str(value), value)
-        self._bytesize_combo.currentIndexChanged.connect(self._save_active_session_properties)
+        self._bytesize_combo.currentIndexChanged.connect(self._commit_serial_settings)
 
         self._parity_combo = QComboBox()
         self._parity_combo.addItem("无", serial.PARITY_NONE)
@@ -370,20 +449,31 @@ class TerminalWidget(QWidget):
         self._parity_combo.addItem("奇校验", serial.PARITY_ODD)
         self._parity_combo.addItem("Mark", serial.PARITY_MARK)
         self._parity_combo.addItem("Space", serial.PARITY_SPACE)
-        self._parity_combo.currentIndexChanged.connect(self._save_active_session_properties)
+        self._parity_combo.currentIndexChanged.connect(self._commit_serial_settings)
 
         self._stopbits_combo = QComboBox()
         self._stopbits_combo.addItem("1", serial.STOPBITS_ONE)
         self._stopbits_combo.addItem("1.5", serial.STOPBITS_ONE_POINT_FIVE)
         self._stopbits_combo.addItem("2", serial.STOPBITS_TWO)
-        self._stopbits_combo.currentIndexChanged.connect(self._save_active_session_properties)
+        self._stopbits_combo.currentIndexChanged.connect(self._commit_serial_settings)
 
         self._flow_combo = QComboBox()
         self._flow_combo.addItem("无", "none")
         self._flow_combo.addItem("XON/XOFF", "xonxoff")
         self._flow_combo.addItem("RTS/CTS", "rtscts")
         self._flow_combo.addItem("DSR/DTR", "dsrdtr")
-        self._flow_combo.currentIndexChanged.connect(self._save_active_session_properties)
+        self._flow_combo.currentIndexChanged.connect(self._commit_serial_settings)
+
+        self._term_type_combo = QComboBox()
+        self._term_type_combo.addItems(_SHELL_TERM_TYPES)
+        self._term_type_combo.setPlaceholderText("选择 TERM")
+        self._term_type_combo.setCurrentIndex(-1)
+        self._term_type_combo.setToolTip(
+            "在已连接设备的空白 Shell 提示符下选择，将发送 export TERM 命令。\n"
+            "现代彩色终端常用 xterm-256color，精简串口设备可先试 vt100。\n"
+            "显示本次连接最后发送的类型。右键终端可检测设备支持的类型。"
+        )
+        self._term_type_combo.textActivated.connect(self._send_shell_term)
 
         self._connect_btn = QPushButton("连接")
         self._connect_btn.setObjectName("primaryButton")
@@ -402,19 +492,20 @@ class TerminalWidget(QWidget):
         self._reset_btn.setEnabled(False)
         self._reset_btn.clicked.connect(self._trigger_reset)
 
-        self._add_labeled_control(grid, 0, 0, "模式", self._mode_combo)
-        self._add_labeled_control(grid, 0, 2, "串口", self._port_combo)
-        grid.addWidget(self._refresh_btn, 0, 4)
-        self._add_labeled_control(grid, 0, 5, "波特率", self._baud_combo)
-        self._add_labeled_control(grid, 0, 7, "数据位", self._bytesize_combo)
-        self._add_labeled_control(grid, 1, 0, "校验", self._parity_combo)
-        self._add_labeled_control(grid, 1, 2, "停止位", self._stopbits_combo)
-        self._add_labeled_control(grid, 1, 4, "流控", self._flow_combo)
-        grid.addWidget(self._connect_btn, 1, 6)
-        grid.addWidget(self._listen_btn, 1, 7)
-        grid.addWidget(self._disconnect_btn, 1, 8)
-        grid.addWidget(self._reset_btn, 1, 9)
-        grid.setColumnStretch(10, 1)
+        for row, label, editor, *buttons in (
+            (port_row, "模式", self._mode_combo),
+            (port_row, "串口", self._port_combo, self._refresh_btn),
+            (port_row, "波特率", self._baud_combo),
+            (settings_row, "数据位", self._bytesize_combo),
+            (settings_row, "校验", self._parity_combo),
+            (settings_row, "停止位", self._stopbits_combo),
+            (settings_row, "流控", self._flow_combo),
+            (settings_row, "终端类型", self._term_type_combo),
+        ):
+            caption = self._make_label(label)
+            caption.setBuddy(editor)
+            editor.setAccessibleName(label)
+            row.addWidget(self._config_group(caption, editor, *buttons))
 
         self._compact_btn = QPushButton("精简")
         self._compact_btn.setObjectName("terminalViewToggle")
@@ -429,16 +520,15 @@ class TerminalWidget(QWidget):
         self._fullscreen_btn.setToolTip("切换应用全屏显示；可与精简模式同时启用")
         self._fullscreen_btn.toggled.connect(self._on_fullscreen_toggled)
 
-        config_row = QHBoxLayout()
-        config_row.setContentsMargins(0, 0, 0, 0)
-        config_row.setSpacing(8)
-        config_row.addWidget(self._serial_config_widget, 100)
-        config_row.addStretch(1)
-        config_row.addWidget(self._compact_btn, alignment=Qt.AlignmentFlag.AlignBottom)
-        config_row.addWidget(self._fullscreen_btn, alignment=Qt.AlignmentFlag.AlignBottom)
+        actions = self._config_group(
+            self._connect_btn, self._listen_btn, self._disconnect_btn,
+            self._reset_btn, self._compact_btn, self._fullscreen_btn,
+        )
+        settings_row.addWidget(actions)
+        settings_row.setAlignment(actions, Qt.AlignmentFlag.AlignRight)
 
         control_layout.addLayout(header)
-        control_layout.addLayout(config_row)
+        control_layout.addWidget(self._serial_config_widget)
 
         self._log = QTextBrowser()
         self._log.setObjectName("terminalLog")
@@ -469,7 +559,8 @@ class TerminalWidget(QWidget):
         input_header.setSpacing(8)
         self._input_title = QLabel("发送")
         self._input_title.setObjectName("sectionTitle")
-        self._unix_input_hint = QLabel("点击终端后直接输入")
+        self._unix_input_hint = QLabel("直接输入 · 右键检测 TERM")
+        self._unix_input_hint.setToolTip("在设备的 Shell 提示符下，右键终端可检查或设置当前 Shell 的 TERM。")
         self._unix_input_hint.setObjectName("terminalSessionHint")
         self._unix_input_hint.hide()
         self._unix_quick_buttons: dict[str, QPushButton] = {}
@@ -478,7 +569,7 @@ class TerminalWidget(QWidget):
             ("Tab", b"\t", "命令或路径补全"),
             ("↑", b"\x1b[A", "上一条历史命令 / 向上移动"),
             ("↓", b"\x1b[B", "下一条历史命令 / 向下移动"),
-            ("Ctrl+L", b"\x0c", "清屏并请求终端重绘"),
+            ("Ctrl+L", b"\x0c", "清除当前 Unix 屏幕和滚动历史，并请求设备重绘"),
             ("Esc", b"\x1b", "退出当前菜单或操作"),
         ):
             button = QPushButton(label)
@@ -491,7 +582,7 @@ class TerminalWidget(QWidget):
                 button.clicked.connect(self._paste_unix_terminal)
             else:
                 button.clicked.connect(
-                    lambda _checked=False, data=payload: self._send_unix_quick_bytes(data)
+                    lambda _checked=False, data=payload: self._send_unix_key_bytes(data)
                 )
             button.hide()
             self._unix_quick_buttons[label] = button
@@ -599,11 +690,14 @@ class TerminalWidget(QWidget):
         layout.setColumnStretch(0, 1)
         return page
 
-    def _add_labeled_control(
-        self, grid: QGridLayout, row: int, col: int, label: str, widget: QWidget
-    ) -> None:
-        grid.addWidget(self._make_label(label), row, col)
-        grid.addWidget(widget, row, col + 1)
+    def _config_group(self, *widgets: QWidget) -> QWidget:
+        group = QWidget()
+        row = QHBoxLayout(group)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        for widget in widgets:
+            row.addWidget(widget)
+        return group
 
     def _make_label(self, text: str) -> QLabel:
         label = QLabel(text)
@@ -788,17 +882,54 @@ class TerminalWidget(QWidget):
         )
 
     def refresh_ports(self) -> None:
-        current_port = self._selected_port()
+        self._request_port_scan(announce=True)
+
+    def _request_port_scan(self, announce: bool = False) -> None:
+        if not self._port_timer.isActive():
+            return
+        self._announce_scan |= announce
+        if not self._scan_running:
+            self._scan_running = True
+            QThreadPool.globalInstance().start(self._port_scan.run)
+
+    def _port_scan_finished(self, devices: list, error: str) -> None:
+        self._scan_running = False
+        announce, self._announce_scan = self._announce_scan, False
+        if not self._port_timer.isActive():
+            return
+        if error:
+            if announce:
+                self._append_sys(f"刷新串口失败：{error}")
+            return
+        self._update_port_list(devices, announce)
+        for session in self._sessions.values():
+            if session.listening and session.serial_thread is None:
+                self._try_listener_reconnect(session.session_id)
+
+    def _update_port_list(self, devices: list, announce: bool) -> None:
+        self._enumerated_ports = {device.device.lower() for device in devices}
         ports: list[tuple[str, str]] = []
-        self._port_descriptions.clear()
-        for port_info in list_ports.comports():
+        for port_info in devices:
             if self._port_registry.is_blocked(port_info):
                 continue
             device = port_info.device
             desc = port_info.description if port_info.description and port_info.description != "n/a" else "串口设备"
-            self._port_descriptions[device.lower()] = desc
             ports.append((device, desc))
         ports.sort(key=lambda item: _port_sort_key(item[0]))
+        self._latest_ports = ports
+        self._port_descriptions = {device.lower(): desc for device, desc in ports}
+        if announce:
+            self._append_sys(f"已刷新串口：{len(ports)} 个")
+        if self._port_combo.view().isVisible() or (not announce and self._port_combo.hasFocus()):
+            return
+        self._apply_port_list(select_first=self._port_snapshot is None or announce)
+
+    def _apply_port_list(self, select_first: bool = False) -> None:
+        ports = self._latest_ports
+        if ports == self._port_snapshot:
+            return
+        current_port = self._selected_port()
+        self._port_snapshot = ports
 
         self._port_combo.blockSignals(True)
         self._port_combo.clear()
@@ -812,16 +943,17 @@ class TerminalWidget(QWidget):
             else:
                 self._port_combo.setCurrentIndex(self._port_combo.count() - 1)
                 self._port_combo.setEditText(current_port)
-        elif ports:
+        elif ports and select_first:
             self._port_combo.setCurrentIndex(0)
         else:
-            self._port_combo.setCurrentIndex(0)
+            self._port_combo.setCurrentIndex(self._port_combo.count() - 1)
             self._port_combo.setEditText("")
         self._port_combo.blockSignals(False)
+        self._port_combo.setToolTip(self._port_combo.currentText())
         if self._port_combo.lineEdit() is not None:
             self._port_combo.lineEdit().setPlaceholderText("选择串口或输入自定义串口")
-
-        self._append_sys(f"已刷新串口：{len(ports)} 个")
+            if self._port_combo.currentData() != CUSTOM_PORT_DATA:
+                self._port_combo.lineEdit().setCursorPosition(0)
 
     def _find_port_index(self, port: str) -> int:
         for idx in range(self._port_combo.count()):
@@ -850,6 +982,8 @@ class TerminalWidget(QWidget):
                 self._port_combo.setEditText("")
             if self._port_combo.lineEdit() is not None:
                 self._port_combo.lineEdit().setPlaceholderText("输入串口，如 COM9")
+        elif self._port_combo.lineEdit() is not None:
+            self._port_combo.lineEdit().setCursorPosition(0)
         self._save_active_session_properties()
 
     def _collect_config(self, show_errors: bool = True) -> TerminalSerialConfig | None:
@@ -860,9 +994,11 @@ class TerminalWidget(QWidget):
             return None
         try:
             baudrate = int(self._baud_combo.currentText().strip())
+            if baudrate <= 0:
+                raise ValueError
         except ValueError:
             if show_errors:
-                QMessageBox.warning(self, "提示", "波特率必须是整数。")
+                QMessageBox.warning(self, "提示", "波特率必须是正整数。")
             return None
         return TerminalSerialConfig(
             port=port,
@@ -929,6 +1065,10 @@ class TerminalWidget(QWidget):
         )
         thread = TerminalSerialThread(config, self)
         thread.opened.connect(lambda message, sid=session_id: self._serial_opened(sid, message))
+        thread.settings_applied.connect(
+            lambda requested, applied, error, sid=session_id:
+                self._serial_settings_applied(sid, thread, requested, applied, error)
+        )
         thread.data_received.connect(lambda data, sid=session_id: self._serial_data_received(sid, data))
         thread.error.connect(lambda message, sid=session_id: self._serial_error(sid, message))
         thread.closed.connect(lambda sid=session_id: self._serial_closed(sid))
@@ -946,6 +1086,7 @@ class TerminalWidget(QWidget):
             self._set_session_status(session.session_id, "已断开")
             return
         session.closing_requested = True
+        self._update_active_connection_controls()
         self._append_sys("正在断开串口", session_id=session.session_id)
         session.serial_thread.request_stop()
         self._disconnect_btn.setEnabled(False)
@@ -977,7 +1118,7 @@ class TerminalWidget(QWidget):
             return
         if session.serial_thread is None:
             self._set_status("监听中", "listening")
-            self._try_listener_reconnect(session.session_id)
+            self._request_port_scan()
             timer = self._timer_for_session(session.session_id)
             if session.serial_thread is None and not timer.isActive():
                 timer.start()
@@ -1006,12 +1147,7 @@ class TerminalWidget(QWidget):
         self._start_serial_thread(config, session_id=session_id)
 
     def _port_is_available(self, port: str) -> bool:
-        target = port.lower()
-        for port_info in list_ports.comports():
-            if str(port_info.device).lower() == target:
-                self._port_registry.observe_device(port_info)
-                return True
-        return False
+        return port.lower() in self._enumerated_ports
 
     def _schedule_listener_reconnect(self, session_id: int) -> None:
         session = self._sessions.get(session_id)
@@ -1023,6 +1159,7 @@ class TerminalWidget(QWidget):
             timer.start()
 
     def shutdown(self, wait_ms: int = 3000) -> bool:
+        self._port_timer.stop()
         for timer in self._reconnect_timers.values():
             timer.stop()
         threads: list[tuple[TerminalSession, TerminalSerialThread]] = []
@@ -1065,6 +1202,10 @@ class TerminalWidget(QWidget):
         session = self._sessions.get(session_id)
         if session is None:
             return
+        session.last_sent_term = ""
+        if session.pending_config and session.config and session is self._active_session():
+            self._show_serial_settings(session.config)
+        session.pending_config = None
         if session.closing_requested:
             self._append_sys("串口已断开", session_id=session_id)
             self._set_session_status(session_id, "已断开")
@@ -1083,16 +1224,17 @@ class TerminalWidget(QWidget):
         self._update_active_connection_controls()
 
     def _set_connected_controls(self, connected: bool) -> None:
+        session = self._active_session()
+        can_edit = not connected or (session is not None and session.status == "已连接" and not session.closing_requested)
+        self._port_combo.setEnabled(not connected)
         for widget in (
-            self._port_combo,
-            self._refresh_btn,
             self._baud_combo,
             self._bytesize_combo,
             self._parity_combo,
             self._stopbits_combo,
             self._flow_combo,
         ):
-            widget.setEnabled(not connected)
+            widget.setEnabled(can_edit)
         self._connect_btn.setEnabled(not connected)
         self._disconnect_btn.setEnabled(connected)
         self._reset_btn.setEnabled(connected)
@@ -1105,7 +1247,7 @@ class TerminalWidget(QWidget):
         if timer is None:
             timer = QTimer(self)
             timer.setInterval(1000)
-            timer.timeout.connect(lambda sid=session_id: self._try_listener_reconnect(sid))
+            timer.timeout.connect(self._request_port_scan)
             self._reconnect_timers[session_id] = timer
         return timer
 
@@ -1113,6 +1255,7 @@ class TerminalWidget(QWidget):
         session = self._active_session()
         connected = session is not None and session.serial_thread is not None
         self._set_connected_controls(connected)
+        self._update_term_type_combo()
         if session is not None:
             self._listen_btn.blockSignals(True)
             self._listen_btn.setChecked(session.listening)
@@ -1155,10 +1298,60 @@ class TerminalWidget(QWidget):
         session.auto_follow = self._auto_follow_btn.isChecked()
         session.listening = self._listen_btn.isChecked()
         session.send_history = self._send_history
-        config = self._collect_config(show_errors=False)
-        if config is not None:
-            self._update_session_config(session, config)
+        if session.serial_thread is None:
+            config = self._collect_config(show_errors=False)
+            if config is not None:
+                self._update_session_config(session, config)
         self._refresh_session_table()
+
+    def _commit_serial_settings(self, *_args) -> None:
+        session = self._active_session()
+        if self._updating_session_controls or session is None:
+            return
+        if session.serial_thread is None:
+            self._save_active_session_properties()
+            return
+        if session.status != "已连接" or session.closing_requested or session.config is None:
+            return
+        displayed = session.pending_config or session.config
+        config = self._collect_config(show_errors=False)
+        if config is None:
+            self._show_serial_settings(displayed)
+            QMessageBox.warning(self, "串口参数", "请输入有效的正整数波特率。")
+        elif config != displayed:
+            session.pending_config = config
+            session.serial_thread.request_settings(config)
+
+    def _serial_settings_applied(
+        self, session_id: int, thread: TerminalSerialThread, requested: TerminalSerialConfig,
+        applied: TerminalSerialConfig, error: str,
+    ) -> None:
+        session = self._sessions.get(session_id)
+        if session is None or session.serial_thread is not thread:
+            return
+        self._update_session_config(session, applied)
+        latest = session.pending_config is requested
+        if latest:
+            session.pending_config = None
+        self._refresh_session_table()
+        if error:
+            message = f"串口参数未生效，已恢复上次设置。\n{error}"
+            self._append_sys(message, session_id=session_id)
+            if latest and session is self._active_session():
+                self._show_serial_settings(applied)
+                QMessageBox.warning(self, "串口参数", message)
+
+    def _show_serial_settings(self, config: TerminalSerialConfig) -> None:
+        previous = self._updating_session_controls
+        self._updating_session_controls = True
+        try:
+            self._baud_combo.setCurrentText(str(config.baudrate))
+            self._set_combo_data(self._bytesize_combo, config.bytesize)
+            self._set_combo_data(self._parity_combo, config.parity)
+            self._set_combo_data(self._stopbits_combo, config.stopbits)
+            self._set_combo_data(self._flow_combo, config.flow_control)
+        finally:
+            self._updating_session_controls = previous
 
     def _on_session_display_option_changed(self, *_args) -> None:
         self._save_active_session_properties()
@@ -1246,11 +1439,7 @@ class TerminalWidget(QWidget):
         self._set_combo_data(self._newline_combo, session.newline_by_mode[session.mode])
         if session.config is not None:
             self._select_port_text(session.config.port)
-            self._baud_combo.setCurrentText(str(session.config.baudrate))
-            self._set_combo_data(self._bytesize_combo, session.config.bytesize)
-            self._set_combo_data(self._parity_combo, session.config.parity)
-            self._set_combo_data(self._stopbits_combo, session.config.stopbits)
-            self._set_combo_data(self._flow_combo, session.config.flow_control)
+            self._show_serial_settings(session.pending_config or session.config)
         else:
             custom_idx = self._find_custom_port_index()
             if custom_idx >= 0:
@@ -1292,11 +1481,12 @@ class TerminalWidget(QWidget):
 
     def _set_session_status(self, session_id: int, status: str) -> None:
         session = self._sessions.get(session_id)
-        if session is None:
+        if session is None or session.status == status:
             return
         session.status = status
         if session_id == self._active_session_id:
             self._set_status(status, self._state_for_session_status(status))
+            self._update_active_connection_controls()
         self._refresh_session_table()
 
     def _state_for_session_status(self, status: str) -> str:
@@ -1396,6 +1586,13 @@ class TerminalWidget(QWidget):
 
     def _update_mode_input_ui(self, mode: str) -> None:
         unix_terminal = mode == "unix"
+        self._term_type_combo.parentWidget().setVisible(unix_terminal)
+        self._update_term_type_combo()
+        # Unix line wrapping follows the viewport width. Reserve the scrollbar's
+        # space so replacing the document cannot trigger another width change.
+        self._log.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOn if unix_terminal else Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
         self._input_stack.setVisible(not unix_terminal)
         self._input_stack.setCurrentIndex(1 if mode == "plain" else 0)
         self._input_title.setText("输入设置" if unix_terminal else "发送")
@@ -1454,15 +1651,15 @@ class TerminalWidget(QWidget):
             return False
         return self._send_bytes(data)
 
-    def _send_bytes(self, data: bytes) -> bool:
+    def _send_bytes(self, data: bytes, *, clears_unix_display: bool = False) -> bool:
         if not data:
             return True
         session = self._active_session()
         if session is None or session.serial_thread is None:
-            self._append_sys("发送失败：串口未连接")
+            self._append_record("SYS", b"", "发送失败：串口未连接", clears_unix_display=clears_unix_display)
             return False
         session.serial_thread.send(data)
-        self._append_record("TX", data)
+        self._append_record("TX", data, clears_unix_display=clears_unix_display)
         return True
 
     def _remember_send_history(self, text: str) -> None:
@@ -1558,7 +1755,7 @@ class TerminalWidget(QWidget):
             return True
         if data is None:
             return False
-        self._send_bytes(data)
+        self._send_unix_key_bytes(data)
         return True
 
     def _paste_unix_terminal(self) -> None:
@@ -1606,6 +1803,8 @@ class TerminalWidget(QWidget):
             )
             label = "粘贴并发送到串口" if unix else "粘贴到发送框"
             menu.addAction(f"{label}\tCtrl+V", self._paste_from_log).setEnabled(can_paste)
+            if unix:
+                self._add_shell_term_menu(menu, session)
             menu.addSeparator()
             menu.addAction("清空日志", self._clear_log).setEnabled(has_text)
         else:
@@ -1618,8 +1817,49 @@ class TerminalWidget(QWidget):
             menu.addAction("全选\tCtrl+A", view.selectAll).setEnabled(has_text)
         return menu
 
-    def _send_unix_quick_bytes(self, data: bytes) -> None:
-        self._send_bytes(data)
+    def _can_send_shell_term(self, session: TerminalSession | None) -> bool:
+        return (
+            session is not None
+            and self._current_mode() == "unix"
+            and session.serial_thread is not None
+            and session.status == "已连接"
+            and not session.closing_requested
+        )
+
+    def _update_term_type_combo(self) -> None:
+        session = self._active_session()
+        combo = self._term_type_combo
+        combo.hidePopup()
+        combo.setEnabled(self._can_send_shell_term(session))
+        combo.setCurrentIndex(combo.findText(session.last_sent_term) if session else -1)
+
+    def _send_shell_term(self, term: str | None) -> None:
+        session = self._active_session()
+        if session is None or not self._can_send_shell_term(session):
+            return
+        command = _SHELL_TERM_PROBE if term is None else f"export TERM={term}"
+        if self._send_text(command + self._current_newline()) and term is not None:
+            session.last_sent_term = term
+        self._update_term_type_combo()
+        self._log.setFocus()
+
+    def _add_shell_term_menu(self, menu: QMenu, session: TerminalSession | None) -> None:
+        term_menu = menu.addMenu("设备终端类型（TERM）")
+        thread = session.serial_thread if session is not None else None
+
+        def send(term: str | None) -> None:
+            # A context menu can stay open across a reconnect.
+            if session is not None and self._active_session() is session and session.serial_thread is thread:
+                self._send_shell_term(term)
+
+        term_menu.setEnabled(self._can_send_shell_term(session))
+        term_menu.addAction("检测可用类型（+ 表示可用）", lambda: send(None))
+        term_menu.addSeparator()
+        for term in _SHELL_TERM_TYPES:
+            term_menu.addAction(f"export TERM={term}", lambda checked=False, value=term: send(value))
+
+    def _send_unix_key_bytes(self, data: bytes) -> None:
+        self._send_bytes(data, clears_unix_display=data == b"\x0c")
         self._log.setFocus()
 
     def _can_use_history(self, source: QWidget, previous: bool) -> bool:
@@ -1684,6 +1924,8 @@ class TerminalWidget(QWidget):
         payload: bytes,
         message: str = "",
         session_id: int | None = None,
+        *,
+        clears_unix_display: bool = False,
     ) -> None:
         records, overrides = self._records_for_session(session_id)
         records.append(
@@ -1693,16 +1935,21 @@ class TerminalWidget(QWidget):
                 timestamp=datetime.now(),
                 payload=payload,
                 message=message,
+                clears_unix_display=clears_unix_display,
             )
         )
         self._next_record_id += 1
+        unix_screen_changed = direction == "RX" or clears_unix_display
         if len(records) > self._MAX_RECORDS:
             removed = records[: len(records) - self._MAX_RECORDS]
             del records[: len(records) - self._MAX_RECORDS]
             for record in removed:
                 overrides.pop(record.record_id, None)
+                if record.direction == "RX" or record.clears_unix_display:
+                    unix_screen_changed = True
         if session_id is None or session_id == self._active_session_id:
-            self._schedule_render()
+            if self._current_mode() != "unix" or unix_screen_changed:
+                self._schedule_render()
 
     def _records_for_session(
         self, session_id: int | None
@@ -1719,7 +1966,7 @@ class TerminalWidget(QWidget):
             self._render_timer.start()
 
     def _render_log(self) -> None:
-        text, is_html = self._build_display_text()
+        unix = self._current_mode() == "unix"
         scrollbar = self._log.verticalScrollBar()
         previous_value = scrollbar.value()
         previous_max = scrollbar.maximum()
@@ -1728,12 +1975,20 @@ class TerminalWidget(QWidget):
         anchor, position = cursor.anchor(), cursor.position()
         selection = cursor.selectedText()
         self._updating_log_scroll = True
-        if is_html:
-            self._log.setHtml(text)
+        if unix:
+            if not self._update_unix_document():
+                self._updating_log_scroll = False
+                return
         else:
-            self._log.setPlainText(text)
-        if selection and max(anchor, position) < self._log.document().characterCount():
-            cursor = self._log.textCursor()
+            self._unix_html_lines = None
+            text, is_html = self._build_display_text()
+            if is_html:
+                self._log.setHtml(text)
+            else:
+                self._log.setPlainText(text)
+        cursor = self._log.textCursor()
+        if (selection and (cursor.anchor(), cursor.position()) != (anchor, position)
+                and max(anchor, position) < self._log.document().characterCount()):
             cursor.setPosition(anchor)
             cursor.setPosition(position, QTextCursor.MoveMode.KeepAnchor)
             if cursor.selectedText() == selection:
@@ -1743,6 +1998,8 @@ class TerminalWidget(QWidget):
         else:
             self._set_log_scroll_value(min(previous_value, scrollbar.maximum()))
         self._updating_log_scroll = False
+        if unix:
+            return
 
         # QTextBrowser may finish layout after setHtml returns. Apply the same
         # scroll rule once more after the event loop so manual scroll position
@@ -1792,28 +2049,53 @@ class TerminalWidget(QWidget):
         if checked:
             QTimer.singleShot(0, self._scroll_log_to_bottom)
 
-    def _build_display_text(self) -> tuple[str, bool]:
-        mode = self._current_mode()
-        if mode == "unix":
-            session = self._active_session()
-            if session is None:
-                return self._build_html_page(""), True
+    def _update_unix_document(self) -> bool:
+        session = self._active_session()
+        lines = [""]
+        if session is not None:
             viewport = self._log.viewport()
             text_width = viewport.width() - 2 * self._log.document().documentMargin()
             cell_width = QFontMetricsF(self._log.font(), viewport).horizontalAdvance("M")
             session.unix_terminal.sync(
                 (
-                    (record.record_id, record.payload)
+                    (record.record_id, None if record.clears_unix_display else record.payload)
                     for record in self._records
-                    if record.direction == "RX"
+                    if record.direction == "RX" or record.clears_unix_display
                 ),
                 self._current_encoding(),
                 columns=max(1, int(text_width / cell_width)),
             )
-            return (
-                self._build_html_page(session.unix_terminal.render_html()),
-                True,
-            )
+            lines = session.unix_terminal.render_html_lines()
+
+        previous = self._unix_html_lines
+        if lines == previous:
+            return False
+        document = self._log.document()
+        if previous is None or document.blockCount() != len(previous):
+            cursor = QTextCursor(document)
+            cursor.select(QTextCursor.SelectionType.Document)
+            html_lines = lines
+        else:
+            # Keep unchanged QTextBlocks in place, including the scrollback.
+            # Include one common row when appending or removing whole lines so
+            # the edit also inserts or removes the separating paragraph break.
+            first = 0
+            while first < min(len(lines), len(previous)) - 1 and lines[first] == previous[first]:
+                first += 1
+            old_end, new_end = len(previous), len(lines)
+            while old_end > first + 1 and new_end > first + 1 and previous[old_end - 1] == lines[new_end - 1]:
+                old_end -= 1
+                new_end -= 1
+            cursor = QTextCursor(document.findBlockByNumber(first))
+            last = document.findBlockByNumber(old_end - 1)
+            cursor.setPosition(last.position() + last.length() - 1, QTextCursor.MoveMode.KeepAnchor)
+            html_lines = lines[first:new_end]
+        cursor.insertHtml(self._build_html_page("\n".join(html_lines), unix=True))
+        self._unix_html_lines = lines
+        return True
+
+    def _build_display_text(self) -> tuple[str, bool]:
+        mode = self._current_mode()
 
         timestamp_enabled = self._timestamp_check.isChecked()
         hex_enabled = self._hex_check.isChecked()
@@ -1908,11 +2190,12 @@ class TerminalWidget(QWidget):
         )
         return f"{label_html} {link} {self._colorize_html_text(body)}"
 
-    def _build_html_page(self, body: str) -> str:
+    def _build_html_page(self, body: str, *, unix: bool = False) -> str:
+        margin = "margin:0;" if unix else ""
         return (
             "<html><body>"
             "<pre style=\"font-family: Consolas, Menlo, 'DejaVu Sans Mono', monospace; "
-            "font-size: 10pt; color: #d1d5db; white-space: pre;\">"
+            f"font-size: 10pt; color: #d1d5db; white-space: pre;{margin}\">"
             f"{body}"
             "</pre></body></html>"
         )
@@ -2012,6 +2295,7 @@ class TerminalWidget(QWidget):
     def _clear_log(self) -> None:
         self._records.clear()
         self._record_hex_overrides.clear()
+        self._unix_html_lines = None
         self._log.clear()
 
     def closeEvent(self, event) -> None:

@@ -61,11 +61,17 @@ Duration covers preparation, connection, erase, write, verification, reset and f
 
 ## Recent firmware source flow
 
+The × on each recent source removes that entry from the shared history, including missing paths. Delete performs the same action on the highlighted entry. The menu refreshes after a successful save. If saving fails, it reports the error and retains the entry. The selected firmware, flash addresses and source files are preserved.
+
 Valid file selections, path edits, successful build imports and actual flash attempts update the shared source history. The most recent source is first, duplicate canonical paths are moved rather than copied, and bin/build entries share a maximum of 16. Persist atomically beside device_policies.json as firmware_history.json. A failed write preserves the previous record and reports that the current selection is still valid.
 
 The separator is always below the two established picker commands. Empty history shows a disabled “暂无使用记录”. Full canonical paths are retained in action data and tooltips, while only the display label is shortened. A missing bin or build manifest disables that action. Selecting a bin restores its path and filename-derived address; selecting a build uses the existing atomic import flow and rereads its current manifest, with no implicit flashing.
 
 ## Accessibility, locality, and verification
+
+The Unix terminal TERM selector and log context menu send shell commands only on explicit selection in the active connection. The selector displays the last type sent on that connection and clears on disconnect. Opening or restoring a session leaves the device shell untouched.
+
+Only Unix mode shows the TERM label and selector. Ctrl+L clears that session's displayed screen and scrollback and sends the redraw key to the connected device. Raw serial records remain available. Serial framing and flow changes apply on the existing connection in send order. The background port scan runs every five seconds and preserves the current port and active editor.
 
 Names use plain text, a full tooltip, and a full accessible name. The icon is a native focusable button with a Chinese accessible label. Native QMenu/QAction provide checked state, arrow-key submenu access, Escape and viewport collision behavior. Disabled actions cannot dispatch work. Ribbon text provides a non-color state cue.
 
